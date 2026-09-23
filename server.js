@@ -574,3 +574,859 @@ h+='<div class="card"><b>Resultados:</b> '+s.stats.wins+' ganadoras · '+s.stats
 app.listen(PORT,"0.0.0.0",()=>{console.log("SUPREMO V13 listening on "+PORT);scan().catch(e=>logEvent("START_SCAN_ERROR",null,{message:e.message})).finally(function loop(){setTimeout(()=>scan().catch(e=>logEvent("SCAN_ERROR",null,{message:e.message})).finally(loop),CFG.pollMs);});});
 process.on("uncaughtException",e=>console.error("UNCAUGHT_EXCEPTION",e));
 process.on("unhandledRejection",e=>console.error("UNHANDLED_REJECTION",e));
+async function setLeverage(symbol){
+  try{
+    return await signed(
+      'POST',
+      '/fapi/v1/leverage',
+      {
+        symbol,
+        leverage:LEV
+      }
+    );
+  }catch(e){
+    throw e;
+  }
+}
+
+async function order(
+  symbol,
+  side,
+  quantity,
+  reduceOnly=false
+){
+  const p={
+    symbol,
+    side,
+    type:'MARKET',
+    quantity
+  };
+
+  if(mode==='BOTH' && reduceOnly){
+    p.reduceOnly='true';
+  }
+
+  if(mode==='HEDGE'){
+    p.positionSide=
+      side==='BUY'
+        ?'LONG'
+        :'SHORT';
+  }
+
+  return signed(
+    'POST',
+    '/fapi/v1/order',
+    p
+  );
+}
+
+async function open(
+  symbol,
+  side,
+  price,
+  signal
+){
+
+  if(
+    S.positions.length>=MAX_POS ||
+    S.positions.some(
+      p=>p.symbol===symbol
+    )
+  ){
+    return null;
+  }
+
+  const a=
+    await account();
+
+  const available=
+    Number(a.availableBalance||0);
+
+  const margin=
+    Math.min(
+      MARGIN,
+      available*0.05
+    );
+
+  const rules=
+    await symbolRules(symbol);
+
+  const raw=
+    margin*LEV/price;
+
+  const qty=
+    fmtQty(
+      raw,
+      rules.step
+    );
+
+  if(
+    Number(qty)<rules.minQty ||
+    Number(qty)*price<
+      rules.minNotional
+  ){
+    throw new Error(
+      `${symbol}: tamaño mínimo Binance supera el margen configurado`
+    );
+  }
+
+  await setLeverage(symbol);
+
+  if(!LIVE){
+
+    const p={
+      symbol,
+      side,
+      entry:price,
+      current:price,
+      qty:Number(qty),
+      margin,
+      sl:
+        side==='LONG'
+          ?price*(1-SL)
+          :price*(1+SL),
+      tp:
+        side==='LONG'
+          ?price*(1+TP)
+          :price*(1-TP),
+      opened:Date.now(),
+      high:price,
+      low:price,
+      pnl:0,
+      paper:true,
+      score:signal.score
+    };
+
+    S.positions.push(p);
+
+    p._protectedSL=p.sl;
+    p._protectedTP=p.tp;
+
+    return p;
+  }
+
+  const resp=
+    await order(
+      symbol,
+      side==='LONG'
+        ?'BUY'
+        :'SELL',
+      qty,
+      false
+    );
+
+  const fill=
+    Number(
+      resp.avgPrice||price
+    );
+
+  const p={
+    symbol,
+    side,
+    entry:fill,
+    current:fill,
+    qty:Number(qty),
+    margin,
+    sl:
+      side==='LONG'
+        ?fill*(1-SL)
+        :fill*(1+SL),
+    tp:
+      side==='LONG'
+        ?fill*(1+TP)
+        :fill*(1-TP),
+    opened:Date.now(),
+    high:fill,
+    low:fill,
+    pnl:0,
+    orderId:resp.orderId,
+    score:signal.score
+  };
+
+  S.positions.push(p);
+
+  p._protectedSL=p.sl;
+  p._protectedTP=p.tp;
+
+  await protect(p);
+
+  return p;
+}
+
+async function cancelBotProtection(
+  symbol
+){
+
+  try{
+
+    const o=
+      await signed(
+        'GET',
+        '/fapi/v1/openOrders',
+        {symbol}
+      );
+
+    for(
+      const x of o
+    ){
+
+      const cid=
+        String(
+          x.clientOrderId||''
+        );
+
+      if(
+        cid.startsWith('TIERRA_')
+      ){
+
+        await signed(
+          'DELETE',
+          '/fapi/v1/order',
+          {
+            symbol,
+            orderId:x.orderId
+          }
+        );
+
+      }
+    }
+
+  }catch(e){
+
+    S.lastError=
+      e.message;
+
+  }
+}
+
+async function protect(p){
+
+  if(!LIVE)return;
+
+  await cancelBotProtection(
+    p.symbol
+  );
+
+  const closeSide=
+    p.side==='LONG'
+      ?'SELL'
+      :'BUY';
+
+  const ps=
+    mode==='HEDGE'
+      ?{positionSide:p.side}
+      :{reduceOnly:'true'};
+
+  const tag=
+    `TIERRA_${p.symbol}_${p.orderId||Date.now()}`;
+
+  await signed(
+    'POST',
+    '/fapi/v1/order',
+    {
+      symbol:p.symbol,
+      side:closeSide,
+      type:'STOP_MARKET',
+      stopPrice:p.sl,
+      closePosition:'true',
+      newClientOrderId:
+        (tag+'_SL').slice(0,36),
+      ...ps
+    }
+  );
+
+  await signed(
+    'POST',
+    '/fapi/v1/order',
+    {
+      symbol:p.symbol,
+      side:closeSide,
+      type:'TAKE_PROFIT_MARKET',
+      stopPrice:p.tp,
+      closePosition:'true',
+      newClientOrderId:
+        (tag+'_TP').slice(0,36),
+      ...ps
+    }
+  );
+}
+
+async function close(
+  p,
+  reason
+){
+
+  if(LIVE){
+
+    await cancelBotProtection(
+      p.symbol
+    );
+
+    const side=
+      p.side==='LONG'
+        ?'SELL'
+        :'BUY';
+
+    if(mode==='HEDGE'){
+
+      await order(
+        p.symbol,
+        side,
+        p.qty,
+        false
+      );
+
+    }else{
+
+      await order(
+        p.symbol,
+        side,
+        p.qty,
+        true
+      );
+
+    }
+  }
+
+  S.realized+=
+    Number(p.pnl||0);
+
+  S.history.unshift({
+    time:
+      new Date().toISOString(),
+    symbol:p.symbol,
+    side:p.side,
+    pnl:p.pnl||0,
+    reason
+  });
+
+  S.history=
+    S.history.slice(0,200);
+
+  S.positions=
+    S.positions.filter(
+      x=>x!==p
+    );
+}
+
+async function manage(){
+
+  for(
+    const p of [...S.positions]
+  ){
+
+    try{
+
+      const t=
+        await ticker(p.symbol);
+
+      p.current=
+        Number(t.price);
+
+      p.pnl=
+        p.side==='LONG'
+          ?(p.current-p.entry)*p.qty
+          :(p.entry-p.current)*p.qty;
+
+      p.high=
+        Math.max(
+          p.high,
+          p.current
+        );
+
+      p.low=
+        Math.min(
+          p.low,
+          p.current
+        );
+
+      const profitPct=
+        p.side==='LONG'
+          ?(p.current/p.entry-1)
+          :(p.entry/p.current-1);
+
+      const halfTP=
+        TP*0.5;
+
+      /*
+       BREAK-EVEN:
+       cuando la operación alcanza
+       la mitad del objetivo,
+       el stop se mueve ligeramente
+       por encima/debajo de la entrada.
+      */
+
+      if(
+        profitPct>=halfTP
+      ){
+
+        if(p.side==='LONG'){
+
+          p.sl=
+            Math.max(
+              p.sl,
+              p.entry*(1+0.0005)
+            );
+
+        }else{
+
+          p.sl=
+            Math.min(
+              p.sl,
+              p.entry*(1-0.0005)
+            );
+
+        }
+      }
+
+      /*
+       TRAILING ADAPTATIVO
+      */
+
+      const dynTrail=
+        Math.max(
+          TRAIL,
+          p.atrPct
+            ?Math.min(
+              TRAIL*2,
+              p.atrPct*0.8
+            )
+            :TRAIL
+        );
+
+      const trail=
+        (
+          p.side==='LONG' &&
+          p.high>=
+            p.entry*(1+halfTP) &&
+          p.current<=
+            p.high*(1-dynTrail)
+        ) ||
+        (
+          p.side==='SHORT' &&
+          p.low<=
+            p.entry*(1-halfTP) &&
+          p.current>=
+            p.low*(1+dynTrail)
+        );
+
+      const sl=
+        p.side==='LONG'
+          ?p.current<=p.sl
+          :p.current>=p.sl;
+
+      const tp=
+        p.side==='LONG'
+          ?p.current>=p.tp
+          :p.current<=p.tp;
+
+      /*
+       SALIDA POR ESTANCAMIENTO:
+       ya no son solamente 10 minutos.
+      */
+
+      const stale=
+        Date.now()-p.opened>
+          30*60*1000 &&
+        profitPct<halfTP &&
+        Math.abs(p.pnl)>
+          Math.max(
+            0.05,
+            p.margin*0.01
+          );
+
+      if(
+        sl||
+        tp||
+        trail||
+        stale
+      ){
+
+        await close(
+          p,
+          tp
+            ?'TP'
+            :sl
+              ?'SL'
+              :trail
+                ?'TRAIL'
+                :'STALE'
+        );
+
+      }else if(
+        LIVE &&
+        (
+          p.sl!==p._protectedSL ||
+          p.tp!==p._protectedTP
+        )
+      ){
+
+        p._protectedSL=
+          p.sl;
+
+        p._protectedTP=
+          p.tp;
+
+        await protect(p);
+
+      }
+
+    }catch(e){
+
+      S.lastError=
+        e.message;
+
+    }
+  }
+}
+async function cycle(){
+  if(busy||!S.running)return;busy=true;
+  try{
+    await dual();
+    if(LIVE){const a=await account();S.equity=Number(a.totalWalletBalance||0);S.available=Number(a.availableBalance||0)}
+    await manage();
+    const sig=await topSignals();S.signals=sig;
+    const lead=sig[0];S.regime=regimeFrom(lead?lead.longScore-lead.shortScore:0);
+    const dayPnl=S.history.filter(x=>Date.now()-new Date(x.time).getTime()<86400000).reduce((a,x)=>a+Number(x.pnl||0),0);
+    if(dayPnl<=-MAX_DAILY_LOSS){
+      S.lastError=`Límite diario alcanzado: ${dayPnl.toFixed(4)} USDT`;
+      S.unrealized=S.positions.reduce((a,p)=>a+(p.pnl||0),0);
+      S.lastCycle=new Date().toISOString();
+      return
+    }
+    const longs=S.positions.filter(p=>p.side==='LONG').length,
+          shorts=S.positions.filter(p=>p.side==='SHORT').length;
+    const candidates=sig.filter(x=>x.side!=='WAIT' && Math.max(x.longScore,x.shortScore)>=MIN_SCORE)
+      .sort((a,b)=>Math.max(b.longScore,b.shortScore)-Math.max(a.longScore,a.shortScore));
+
+    for(const x of candidates){
+      if(S.positions.length>=MAX_POS)break;
+      if(S.positions.some(p=>p.symbol===x.symbol))continue;
+      if(x.side==='LONG' && S.positions.filter(p=>p.side==='LONG').length>=MAX_LONG)continue;
+      if(x.side==='SHORT' && S.positions.filter(p=>p.side==='SHORT').length>=MAX_SHORT)continue;
+      try{
+        await open(x.symbol,x.side,x.price,x)
+      }catch(e){
+        S.lastError=e.message
+      }
+    }
+
+    S.unrealized=S.positions.reduce((a,p)=>a+(p.pnl||0),0);
+    S.lastCycle=new Date().toISOString();
+  }catch(e){
+    S.lastError=e.message
+  }finally{
+    busy=false
+  }
+}
+
+async function sync(){
+  if(!LIVE)return;
+  try{
+    const a=await account();
+    S.equity=Number(a.totalWalletBalance||0);
+    S.available=Number(a.availableBalance||0);
+    const pr=await positionsRemote();
+
+    for(const r of pr){
+      const amt=Number(r.positionAmt);
+      if(!amt)continue;
+
+      const symbol=r.symbol,
+            side=mode==='HEDGE'?r.positionSide:(amt>0?'LONG':'SHORT');
+
+      let existing=S.positions.find(p=>p.symbol===symbol&&p.side===side);
+
+      if(!existing){
+        existing={
+          symbol,
+          side,
+          entry:Number(r.entryPrice),
+          current:Number(r.markPrice),
+          qty:Math.abs(amt),
+          margin:Math.abs(Number(r.positionInitialMargin||0)),
+          sl:side==='LONG'
+            ?Number(r.entryPrice)*(1-SL)
+            :Number(r.entryPrice)*(1+SL),
+          tp:side==='LONG'
+            ?Number(r.entryPrice)*(1+TP)
+            :Number(r.entryPrice)*(1-TP),
+          opened:Date.now(),
+          high:Number(r.markPrice),
+          low:Number(r.markPrice),
+          pnl:Number(r.unRealizedProfit||0),
+          recovered:true
+        };
+        S.positions.push(existing);
+      }
+
+      existing.current=Number(r.markPrice);
+      existing.pnl=Number(r.unRealizedProfit||0);
+      existing.high=Math.max(existing.high,existing.current);
+      existing.low=Math.min(existing.low,existing.current);
+
+      await protect(existing);
+    }
+  }catch(e){
+    S.lastError=e.message
+  }
+}
+
+function summary(){
+  const h=S.history;
+  const wins=h.filter(x=>x.pnl>0),
+        loss=h.filter(x=>x.pnl<0);
+
+  return {
+    generatedAt:new Date().toISOString(),
+    regime:S.regime,
+    openPositions:S.positions.length,
+    realized:S.realized,
+    unrealized:S.unrealized,
+    trades:h.length,
+    wins:wins.length,
+    losses:loss.length,
+    winRate:h.length?wins.length/h.length:0,
+    avgWin:wins.length?wins.reduce((a,x)=>a+x.pnl,0)/wins.length:0,
+    avgLoss:loss.length?loss.reduce((a,x)=>a+x.pnl,0)/loss.length:0,
+    topSignals:S.signals.slice(0,10)
+  }
+}
+
+const INDEX_HTML = `<!doctype html>
+<html lang="es">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BOSCO FINAL</title>
+<style>
+body{font-family:system-ui;background:#0b1017;color:#eef4f8;margin:0;padding:14px}
+.card{background:#111923;border:1px solid #24303c;border-radius:12px;padding:12px;margin:8px 0}
+button{padding:10px 14px;border-radius:9px;border:1px solid #456;background:#17222d;color:white;font-weight:700;margin:3px}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.big{font-size:20px;font-weight:800}
+@media(max-width:700px){.grid{grid-template-columns:repeat(2,1fr)}}
+table{width:100%;border-collapse:collapse}
+td,th{padding:7px;border-bottom:1px solid #24303c;text-align:left;font-size:12px}
+.good{color:#28d17c}
+.bad{color:#ff5964}
+</style>
+
+<body>
+<h2>🎯 BOSCO FINAL</h2>
+
+<div class="card" id="state">Cargando…</div>
+
+<div class="grid">
+<div class="card">Modo<div class="big" id="mode">—</div></div>
+<div class="card">Equity<div class="big" id="eq">—</div></div>
+<div class="card">P/L<div class="big" id="pnl">—</div></div>
+<div class="card">Posiciones<div class="big" id="pos">—</div></div>
+</div>
+
+<div class="card">
+<button onclick="post('/api/start')">INICIAR</button>
+<button onclick="post('/api/stop')">PAUSAR</button>
+<button onclick="post('/api/close')">CERRAR TODO</button>
+<button onclick="check()">PROBAR BINANCE</button>
+</div>
+
+<div class="card">
+<b>Señales</b>
+<table>
+<thead>
+<tr><th>PAR</th><th>SIDE</th><th>SCORE</th><th>5m</th></tr>
+</thead>
+<tbody id="sig"></tbody>
+</table>
+</div>
+
+<div class="card">
+<b>Posiciones</b>
+<table>
+<thead>
+<tr><th>PAR</th><th>SIDE</th><th>ENTRADA</th><th>ACTUAL</th><th>P/L</th></tr>
+</thead>
+<tbody id="positions"></tbody>
+</table>
+</div>
+
+<script>
+const $=x=>document.getElementById(x);
+
+async function j(u,o){
+  let r=await fetch(u,o);
+  return r.json()
+}
+
+async function post(u){
+  await j(u,{
+    method:'POST',
+    headers:{'content-type':'application/json'}
+  });
+  load()
+}
+
+async function check(){
+  alert(JSON.stringify(await j('/api/binance-check'),null,2))
+}
+
+async function load(){
+  try{
+    const s=await j('/api/status');
+
+    $('state').textContent=
+      (s.lastError?'ERROR: '+s.lastError:'OK')+
+      ' · Régimen '+s.regime+
+      ' · Ciclo '+(s.lastCycle||'—');
+
+    $('mode').textContent=s.live?'LIVE':'PAPER';
+
+    $('eq').textContent='$'+Number(s.equity||0).toFixed(2);
+
+    $('pnl').textContent='$'+
+      Number((s.realized||0)+(s.unrealized||0)).toFixed(4);
+
+    $('pos').textContent=s.positions.length+'/'+10;
+
+    $('sig').innerHTML=s.signals.map(x=>
+      \`<tr>
+        <td>\${x.symbol}</td>
+        <td class="\${x.side==='LONG'?'good':'bad'}">\${x.side}</td>
+        <td>\${Number(x.score).toFixed(3)}</td>
+        <td>\${(x.r5*100).toFixed(3)}%</td>
+      </tr>\`
+    ).join('');
+
+    $('positions').innerHTML=s.positions.map(x=>
+      \`<tr>
+        <td>\${x.symbol}</td>
+        <td>\${x.side}</td>
+        <td>\${x.entry}</td>
+        <td>\${x.current}</td>
+        <td class="\${x.pnl>=0?'good':'bad'}">
+          \${Number(x.pnl||0).toFixed(4)}
+        </td>
+      </tr>\`
+    ).join('')||
+    '<tr><td colspan="5">Sin posiciones</td></tr>'
+
+  }catch(e){
+    $('state').textContent=e.message
+  }
+}
+
+load();
+setInterval(load,3000)
+</script>
+</body>
+</html>`;
+
+app.get('/api/health',(req,res)=>
+  res.json({
+    ok:true,
+    live:LIVE,
+    running:S.running,
+    lastError:S.lastError,
+    warning:S.warning
+  })
+);
+
+app.get('/api/status',(req,res)=>
+  res.json({...S,summary:summary()})
+);
+
+app.get('/api/positions',(req,res)=>
+  res.json(S.positions)
+);
+
+app.get('/api/signals',(req,res)=>
+  res.json(S.signals)
+);
+
+app.get('/api/ai-summary',(req,res)=>
+  res.json(summary())
+);
+
+app.get('/api/binance-check',async(req,res)=>{
+  try{
+    const pub=await publicGet('/ping');
+    let priv=null;
+
+    if(KEY&&SECRET){
+      const a=await account();
+      priv={
+        canTrade:a.canTrade,
+        availableBalance:Number(a.availableBalance||0),
+        totalWalletBalance:Number(a.totalWalletBalance||0),
+        mode:await dual()
+      };
+    }
+
+    res.json({
+      ok:true,
+      public:pub,
+      private:priv,
+      live:LIVE,
+      host:FUT_HOSTS[hostIndex],
+      maxPositions:MAX_POS,
+      leverage:LEV
+    });
+
+  }catch(e){
+    S.lastError=e.message;
+    res.status(502).json({
+      ok:false,
+      error:e.message,
+      live:LIVE
+    })
+  }
+});
+
+app.post('/api/start',(req,res)=>{
+  S.running=true;
+  res.json({
+    ok:true,
+    running:true,
+    live:LIVE
+  })
+});
+
+app.post('/api/stop',(req,res)=>{
+  S.running=false;
+  res.json({
+    ok:true,
+    running:false
+  })
+});
+
+app.post('/api/close',async(req,res)=>{
+  try{
+    for(const p of [...S.positions])
+      await close(p,'MANUAL');
+
+    res.json({ok:true})
+  }catch(e){
+    S.lastError=e.message;
+    res.status(500).json({
+      ok:false,
+      error:e.message
+    })
+  }
+});
+
+setInterval(()=>{
+  sync();
+  cycle()
+},POLL);
+
+app.get('*',(req,res)=>
+  res.type('html').send(INDEX_HTML)
+);
+
+const port=Number(process.env.PORT||8080);
+
+app.listen(
+  port,
+  ()=>console.log(
+    \`Wealth Hunter listening on \${port} | LIVE=\${LIVE}\`
+  )
+);
