@@ -1,35 +1,15 @@
-# SUPREMO V13 — MARKET MICROSTRUCTURE + LEAD/LAG
+# TIERRA · Real-Time Market Intelligence
 
-PAPER only. No Binance API keys required.
+PAPER trading only. This version is based on the previous SUPREMO V13 prototype.
 
-## Qué cambia
-- Escanea TODO el universo de perpetuos USD-M USDT disponibles en Binance.
-- BTC es contexto de mercado, no un filtro que limite las monedas candidatas.
-- Añade análisis multi-timeframe de BTC: 1m/5m/15m/1h.
-- Añade lead/lag para buscar movimientos que comienzan sin perseguir spikes excesivos.
-- Enriquece las mejores candidatas de TODO el mercado con:
-  - Open Interest y cambio de OI.
-  - Funding.
-  - Precio Spot vs Futures (basis/premium simple).
-  - Order book imbalance y spread.
-  - Taker buy/sell flow.
-- Mantiene indicadores técnicos de V12.2 como capa secundaria.
-- Coste PAPER configurable: comisión y slippage estimados.
-- Máximo 4 posiciones y máximo 2 por dirección.
-- Una entrada por ciclo.
-- Evita escaneos solapados: el siguiente ciclo empieza después de terminar el anterior.
-- No invierte automáticamente LONG/SHORT.
+## Visual changes
+- New name: TIERRA.
+- Each open PAPER position has a live visual state:
+  - 🟢 ▲ GANANDO: positive net estimated PnL.
+  - 🔴 ▼ PERDIENDO: negative net estimated PnL.
+  - ⚪ ● NEUTRAL: near zero.
+- Shows entry, current/mark price, net estimated PnL, percentage and a visual bar.
+- Dashboard header and version updated to TIERRA.
 
-## Importante
-La capa de arbitraje se utiliza como **señal relativa/lead-lag**, no como arbitraje ejecutado. El bot no abre dos patas Spot/Futures ni garantiza una ganancia de arbitraje.
-
-Esta versión sigue siendo PAPER y no garantiza beneficios. La finalidad es medir si la información de microestructura y lead/lag mejora la selección frente a V12.2 antes de considerar cualquier operación real.
-
-## Railway
-Start Command: `npm start`
-
-Variables opcionales:
-- `PORT`
-- `INITIAL_CAPITAL` (default 10000)
-- `PAPER_FEE_RATE` (default 0.0004)
-- `PAPER_SLIPPAGE_BPS` (default 3)
+## Important
+The displayed position PnL is PAPER/simulated and uses the bot's estimated fee model. It is not a guarantee of profitability and does not place real Binance orders.
