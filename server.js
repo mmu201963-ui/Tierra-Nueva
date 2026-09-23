@@ -3,7 +3,7 @@ const app = express();
 const PORT = Number(process.env.PORT || 3000);
 
 const CFG = {
-  maxPositions: 4,
+  maxPositions: 10,
   maxSameSide: 2,
   positionRiskPct: 0.02,
   minEdge: 6.5,

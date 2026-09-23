@@ -13,3 +13,8 @@ PAPER trading only. This version is based on the previous SUPREMO V13 prototype.
 
 ## Important
 The displayed position PnL is PAPER/simulated and uses the bot's estimated fee model. It is not a guarantee of profitability and does not place real Binance orders.
+
+
+## Configuración actual
+- Máximo de posiciones PAPER: 10.
+- El motor y la estrategia original se mantienen sin cambios adicionales.
