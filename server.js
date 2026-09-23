@@ -1,17 +1,20 @@
-const express = require("express");
+import express from "express";
+import crypto from "node:crypto";
+
 const app = express();
+app.use(express.json());
 const PORT = Number(process.env.PORT || 3000);
 
 const CFG = {
-  maxPositions: 4,
-  maxSameSide: 2,
+  maxPositions: 10,
+  maxSameSide: 5,
   positionRiskPct: 0.02,
   minEdge: 6.5,
   cooldownMs: 45 * 60 * 1000,
   maxHoldMs: 45 * 60 * 1000,
   pollMs: 15000,
   analysisBatch: 20,
-  microstructureTop: 18,
+  microstructureTop: 24,
   initialCapital: Number(process.env.INITIAL_CAPITAL || 10000),
   feeRate: Number(process.env.PAPER_FEE_RATE || 0.0004),
   slippageBps: Number(process.env.PAPER_SLIPPAGE_BPS || 3)
@@ -19,7 +22,7 @@ const CFG = {
 
 const state = {
   version: "TIERRA REAL-TIME MARKET INTELLIGENCE",
-  mode: "PAPER",
+  mode: process.env.LIVE_TRADING === "true" ? "LIVE" : "PAPER",
   status: "STARTING",
   markets: 0,
   dataMarkets: 0,
@@ -38,7 +41,9 @@ const state = {
   marketContext: {},
   scanRunning: false,
   symbolsCache: [],
-  entryPauseUntil: 0
+  liveAvailable: 0,
+  lastError: null,
+  execution: { orders: 0, live: process.env.LIVE_TRADING === "true" }
 };
 
 function logEvent(type, symbol, data) {
@@ -52,7 +57,7 @@ async function fetchJson(url, timeout = 10000) {
   const c = new AbortController();
   const t = setTimeout(() => c.abort(), timeout);
   try {
-    const r = await fetch(url, { signal: c.signal, headers: { "User-Agent": "TIERRA-PAPER" } });
+    const r = await fetch(url, { signal: c.signal, headers: { "User-Agent": "SUPREMO-V13" } });
     const text = await r.text();
     if (!r.ok) throw new Error("HTTP " + r.status + " " + text.slice(0, 160));
     return JSON.parse(text);
@@ -382,7 +387,7 @@ function bestCandidates(results, liquidityMap) {
 
 function sideCount(side) { return Object.values(state.positions).filter(p => p.side === side).length; }
 
-function enter(c) {
+function paperEnter(c) {
   if (Object.keys(state.positions).length >= CFG.maxPositions) return false;
   if (sideCount(c.side) >= CFG.maxSameSide) return false;
   const allocation = Math.min(state.cash, state.equity * CFG.positionRiskPct);
@@ -418,12 +423,7 @@ function managePosition(p, x) {
   }
   if (age >= CFG.maxHoldMs && !reason) reason = "TIME";
   if (!reason) return;
-  closePositionAtPrice(p, x.price, reason);
-}
-
-function closePositionAtPrice(p, price, reason = "MANUAL") {
-  if (!p || !Number.isFinite(price)) return null;
-  const raw = p.side === "LONG" ? (price - p.entry) * p.qty : (p.entry - price) * p.qty;
+  const raw = p.side === "LONG" ? (x.price - p.entry) * p.qty : (p.entry - x.price) * p.qty;
   const fees = p.allocation * CFG.feeRate + (p.allocation + raw) * CFG.feeRate;
   const pnl = raw - fees;
   state.cash += p.allocation + pnl;
@@ -431,15 +431,218 @@ function closePositionAtPrice(p, price, reason = "MANUAL") {
   if (pnl >= 0) state.stats.wins++; else state.stats.losses++;
   delete state.positions[p.symbol];
   state.cooldown[p.symbol] = Date.now() + CFG.cooldownMs;
-  logEvent("EXIT", p.symbol, { side: p.side, reason, entry: p.entry, exit: price, pnl, fees });
-  return { symbol: p.symbol, side: p.side, entry: p.entry, exit: price, pnl, fees, reason };
+  logEvent("EXIT", p.symbol, { side: p.side, reason, entry: p.entry, exit: x.price, pnl, fees });
 }
 
-async function liveMarkPrice(symbol) {
-  const t = await binance("/fapi/v1/ticker/price?symbol=" + encodeURIComponent(symbol));
-  const price = Number(t.price);
-  if (!Number.isFinite(price) || price <= 0) throw new Error("Precio no válido para " + symbol);
-  return price;
+
+// ===== LIVE BINANCE EXECUTION LAYER =====
+const LIVE = String(process.env.LIVE_TRADING || "false").toLowerCase() === "true";
+const API_KEY = process.env.BINANCE_API_KEY || "";
+const API_SECRET = process.env.BINANCE_API_SECRET || "";
+const LIVE_LEVERAGE = Math.max(1, Math.min(5, Number(process.env.FUTURES_LEVERAGE || 3)));
+const LIVE_MARGIN_PCT = Math.max(0.0025, Math.min(0.03, Number(process.env.LIVE_MARGIN_PCT || 0.01)));
+const LIVE_TP_R = Math.max(1.3, Math.min(3.5, Number(process.env.LIVE_TP_R || 1.9)));
+const LIVE_SL_ATR = Math.max(1.0, Math.min(3.0, Number(process.env.LIVE_SL_ATR || 1.6)));
+const LIVE_MIN_NOTIONAL = Math.max(5, Number(process.env.LIVE_MIN_NOTIONAL || 6));
+const LIVE_MAX_DAILY_LOSS_PCT = Math.max(0.01, Math.min(0.08, Number(process.env.MAX_DAILY_LOSS_PCT || 0.03)));
+let liveMode = "BOTH";
+let liveBusy = false;
+let lastEquitySample = 0;
+
+function hmac(q){ return crypto.createHmac('sha256', API_SECRET).update(q).digest('hex'); }
+function encParams(obj){ return new URLSearchParams(Object.entries(obj).filter(([,v])=>v!==undefined&&v!==null).map(([k,v])=>[k,String(v)])).toString(); }
+async function signedBinance(method,path,params={}){
+  if(!API_KEY||!API_SECRET) throw new Error('Faltan BINANCE_API_KEY/BINANCE_API_SECRET');
+  const p={...params,timestamp:Date.now(),recvWindow:5000};
+  const q=encParams(p);
+  let last;
+  for(let i=0;i<4;i++){
+    const base=["https://fapi.binance.com","https://fapi1.binance.com","https://fapi2.binance.com","https://fapi3.binance.com"][i];
+    try{
+      const r=await fetch(base+path+'?'+q+'&signature='+hmac(q),{method,headers:{'X-MBX-APIKEY':API_KEY,'User-Agent':'TIERRA/1.0'}});
+      const text=await r.text();
+      if(!r.ok) throw new Error(`${r.status}: ${text}`);
+      return JSON.parse(text);
+    }catch(e){ last=e; }
+  }
+  throw last||new Error('Binance private API unavailable');
+}
+async function liveAccount(){ return signedBinance('GET','/fapi/v2/account'); }
+async function livePositions(){ return signedBinance('GET','/fapi/v2/positionRisk'); }
+async function livePositionMode(){
+  try{ const x=await signedBinance('GET','/fapi/v1/positionSide/dual'); liveMode=x.dualSidePosition?'HEDGE':'BOTH'; }
+  catch(e){ state.lastError=e.message; }
+  return liveMode;
+}
+function decimalsForStep(step){
+  const s=String(step);
+  if(s.includes('e-')) return Number(s.split('e-')[1]);
+  return (s.split('.')[1]||'').length;
+}
+function floorStep(q,step){ return Math.floor(q/step)*step; }
+function roundPrice(p,tick){ return tick>0 ? floorStep(p,tick) : p; }
+async function liveSymbolRules(symbol){
+  const info=await binance('/fapi/v1/exchangeInfo');
+  const x=info.symbols.find(v=>v.symbol===symbol);
+  if(!x) throw new Error('Símbolo no encontrado '+symbol);
+  const lot=x.filters.find(f=>f.filterType==='LOT_SIZE');
+  const minN=x.filters.find(f=>f.filterType==='MIN_NOTIONAL'||f.filterType==='NOTIONAL');
+  const priceF=x.filters.find(f=>f.filterType==='PRICE_FILTER');
+  return {step:Number(lot?.stepSize||1),minQty:Number(lot?.minQty||0),minNotional:Number(minN?.notional||minN?.minNotional||0),tick:Number(priceF?.tickSize||0)};
+}
+async function liveLeverage(symbol){ return signedBinance('POST','/fapi/v1/leverage',{symbol,leverage:LIVE_LEVERAGE}); }
+async function liveOrder(symbol,side,quantity,reduceOnly=false,positionSide=null){
+  const p={symbol,side,type:'MARKET',quantity};
+  if(liveMode==='HEDGE') p.positionSide=positionSide || (side==='BUY'?'LONG':'SHORT');
+  else if(reduceOnly) p.reduceOnly='true';
+  return signedBinance('POST','/fapi/v1/order',p);
+}
+async function cancelTierraOrders(symbol){
+  try{
+    const orders=await signedBinance('GET','/fapi/v1/openOrders',{symbol});
+    for(const o of orders){
+      if(String(o.clientOrderId||'').startsWith('TIERRA_')){
+        await signedBinance('DELETE','/fapi/v1/order',{symbol,orderId:o.orderId});
+      }
+    }
+  }catch(e){ state.lastError=e.message; }
+}
+async function protectLivePosition(p){
+  if(!LIVE) return;
+  await cancelTierraOrders(p.symbol);
+  const closeSide=p.side==='LONG'?'SELL':'BUY';
+  const params={
+    symbol:p.symbol, side:closeSide, type:'STOP_MARKET', stopPrice:p.stop,
+    closePosition:'true', workingType:'MARK_PRICE',
+    newClientOrderId:(`TIERRA_${p.symbol}_${p.orderId||Date.now()}_SL`).slice(0,36)
+  };
+  if(liveMode==='HEDGE') params.positionSide=p.side;
+  await signedBinance('POST','/fapi/v1/order',params);
+  const tp={
+    symbol:p.symbol, side:closeSide, type:'TAKE_PROFIT_MARKET', stopPrice:p.tp,
+    closePosition:'true', workingType:'MARK_PRICE',
+    newClientOrderId:(`TIERRA_${p.symbol}_${p.orderId||Date.now()}_TP`).slice(0,36)
+  };
+  if(liveMode==='HEDGE') tp.positionSide=p.side;
+  await signedBinance('POST','/fapi/v1/order',tp);
+}
+function liveCandidateKey(c){ return `${c.symbol}|${c.side}`; }
+function dailyRealizedLive(){
+  const since=Date.now()-86400000;
+  return state.events.filter(e=>e.type==='LIVE_EXIT'&&new Date(e.time).getTime()>=since).reduce((s,e)=>s+Number(e.pnl||0),0);
+}
+async function enterLive(c){
+  if(!LIVE) return false;
+  if(Object.keys(state.positions).length>=CFG.maxPositions) return false;
+  if(sideCount(c.side)>=CFG.maxSameSide) return false;
+  if(state.positions[c.symbol]) return false;
+  const account=await liveAccount();
+  const equity=Number(account.totalWalletBalance||0);
+  const available=Number(account.availableBalance||0);
+  state.liveAvailable=available;
+  state.equity=equity;
+  if(!Number.isFinite(equity)||equity<=0) throw new Error('Equity Binance inválida');
+  const margin=Math.min(equity*LIVE_MARGIN_PCT,available*0.25);
+  if(margin<=0) throw new Error('Margen disponible insuficiente');
+  const rules=await liveSymbolRules(c.symbol);
+  const notional=margin*LIVE_LEVERAGE;
+  const rawQty=notional/c.price;
+  const qty=floorStep(rawQty,rules.step).toFixed(decimalsForStep(rules.step));
+  const qtyN=Number(qty);
+  const minNotional=Math.max(LIVE_MIN_NOTIONAL,rules.minNotional||0);
+  if(qtyN<rules.minQty || qtyN*c.price<minNotional) throw new Error(`${c.symbol}: tamaño mínimo Binance supera el margen`);
+  await liveLeverage(c.symbol);
+  const resp=await liveOrder(c.symbol,c.side==='LONG'?'BUY':'SELL',qty,false,c.side);
+  const entry=Number(resp.avgPrice||c.price);
+  const stopDist=Math.max(c.atr*LIVE_SL_ATR,entry*0.007);
+  const tpDist=stopDist*LIVE_TP_R;
+  const rawStop=c.side==='LONG'?entry-stopDist:entry+stopDist;
+  const rawTp=c.side==='LONG'?entry+tpDist:entry-tpDist;
+  const stop=roundPrice(rawStop,rules.tick);
+  const tp=roundPrice(rawTp,rules.tick);
+  const p={symbol:c.symbol,side:c.side,entry,markPrice:entry,qty:qtyN,allocation:margin,margin,stop,tp,openedAt:Date.now(),score:c.score,regime:c.regime,reasons:c.reasons||[],techScore:c.techScore,microScore:c.microScore,leadLag:c.leadLag,orderId:resp.orderId,live:true};
+  state.positions[c.symbol]=p;
+  state.execution.orders++;
+  state.stats[c.side.toLowerCase()]++;
+  try{ await protectLivePosition(p); p._protectedStop=p.stop; p._protectedTp=p.tp; }catch(e){
+    delete state.positions[c.symbol];
+    try{ await liveOrder(c.symbol,c.side==='LONG'?'SELL':'BUY',qty,liveMode==='BOTH',c.side); }catch{}
+    throw new Error(`Protección Binance falló; operación revertida: ${e.message}`);
+  }
+  logEvent('LIVE_ENTRY',c.symbol,{side:c.side,price:entry,qty:qtyN,margin,score:c.score,stop:p.stop,tp:p.tp,reasons:p.reasons});
+  return true;
+}
+async function closeLivePosition(p,reason='MANUAL',price=null){
+  if(!LIVE) return false;
+  await cancelTierraOrders(p.symbol);
+  const side=p.side==='LONG'?'SELL':'BUY';
+  const resp=await liveOrder(p.symbol,side,p.qty,liveMode==='BOTH',p.side);
+  const exit=Number(resp.avgPrice||price||p.markPrice||p.entry);
+  const raw=p.side==='LONG'?(exit-p.entry)*p.qty:(p.entry-exit)*p.qty;
+  const fees=(p.entry*p.qty+exit*p.qty)*Number(process.env.LIVE_FEE_RATE||0.0004);
+  const pnl=raw-fees;
+  delete state.positions[p.symbol];
+  state.realizedPnl+=pnl;
+  if(pnl>=0) state.stats.wins++; else state.stats.losses++;
+  state.cooldown[p.symbol]=Date.now()+CFG.cooldownMs;
+  logEvent('LIVE_EXIT',p.symbol,{side:p.side,reason,entry:p.entry,exit,pnl,fees});
+  return true;
+}
+async function syncLivePositions(){
+  if(!LIVE) return;
+  const a=await liveAccount();
+  state.equity=Number(a.totalWalletBalance||0);
+  state.liveAvailable=Number(a.availableBalance||0);
+  const remote=await livePositions();
+  const active=new Set();
+  for(const r of remote){
+    const amt=Number(r.positionAmt||0);
+    if(!amt) continue;
+    const side=liveMode==='HEDGE'?r.positionSide:(amt>0?'LONG':'SHORT');
+    const symbol=r.symbol; active.add(symbol);
+    let p=state.positions[symbol];
+    let recovered=false;
+    if(!p){
+      const entry=Number(r.entryPrice), mark=Number(r.markPrice);
+      const margin=Math.abs(Number(r.positionInitialMargin||0));
+      p={symbol,side,entry,markPrice:mark,qty:Math.abs(amt),allocation:margin,margin,stop:side==='LONG'?entry-entry*0.007:entry+entry*0.007,tp:side==='LONG'?entry+entry*0.0133:entry-entry*0.0133,openedAt:Date.now(),score:0,reasons:['RECOVERED'],recovered:true,live:true,_needsProtection:true};
+      state.positions[symbol]=p; recovered=true;
+      logEvent('LIVE_RECOVER',symbol,{side,entry,qty:p.qty});
+    }
+    p.markPrice=Number(r.markPrice); p.pnl=Number(r.unRealizedProfit||0); p.qty=Math.abs(amt);
+    if(recovered){ try{ await protectLivePosition(p); p._needsProtection=false; }catch(e){ state.lastError=e.message; } }
+  }
+  for(const [symbol,p] of Object.entries(state.positions)){
+    if(p.live && !active.has(symbol)) delete state.positions[symbol];
+  }
+}
+async function manageLivePositions(){
+  if(!LIVE) return;
+  for(const p of Object.values({...state.positions})){
+    try{
+      const t=await binance('/fapi/v1/ticker/price?symbol='+encodeURIComponent(p.symbol));
+      const price=Number(t.price); p.markPrice=price;
+      const profitPct=p.side==='LONG'?(price/p.entry-1):(p.entry/price-1);
+      p.high=Math.max(Number(p.high||p.entry),price); p.low=Math.min(Number(p.low||p.entry),price);
+      const half=(p.tp && p.entry)?Math.abs(p.tp-p.entry)/p.entry*0.5:0.005;
+      if(profitPct>=half){
+        if(p.side==='LONG') p.stop=Math.max(p.stop,p.entry*1.0005);
+        else p.stop=Math.min(p.stop,p.entry*0.9995);
+      }
+      const trail=Math.max(0.0025,Math.min(0.012,(p.entry?Math.abs(p.tp-p.entry)/p.entry:0.01)*0.45));
+      const trailing=(p.side==='LONG'&&p.high>=p.entry*(1+half)&&price<=p.high*(1-trail))||(p.side==='SHORT'&&p.low<=p.entry*(1-half)&&price>=p.low*(1+trail));
+      const stopHit=p.side==='LONG'?price<=p.stop:price>=p.stop;
+      const tpHit=p.side==='LONG'?price>=p.tp:price<=p.tp;
+      const stale=Date.now()-p.openedAt>CFG.maxHoldMs && profitPct<half;
+      const regimeFlip=(p.side==='LONG'&&state.marketContext['5m']==='BEAR'&&state.marketContext['15m']==='BEAR')||(p.side==='SHORT'&&state.marketContext['5m']==='BULL'&&state.marketContext['15m']==='BULL');
+      if(stopHit||tpHit||trailing||stale||regimeFlip){
+        await closeLivePosition(p,tpHit?'TP':stopHit?'STOP':trailing?'TRAIL':regimeFlip?'REGIME_FLIP':'TIME',price);
+      } else if(p._protectedStop!==p.stop || p._protectedTp!==p.tp || p._needsProtection){
+        await protectLivePosition(p);
+        p._protectedStop=p.stop; p._protectedTp=p.tp; p._needsProtection=false;
+      }
+    }catch(e){state.lastError=e.message;logEvent('LIVE_MANAGE_ERROR',p.symbol,{message:e.message});}
+  }
 }
 
 async function scan() {
@@ -447,6 +650,7 @@ async function scan() {
   state.scanRunning = true;
   const started = Date.now();
   try {
+    state.mode = LIVE ? "LIVE" : "PAPER";
     state.status = "SCANNING ALL MARKET";
     let symbols = state.symbolsCache;
     if (!symbols.length) { symbols = await loadSymbols(); state.symbolsCache = symbols; }
@@ -486,21 +690,50 @@ async function scan() {
       quoteVol: x.quoteVol, reasons: x.reasons || []
     }));
 
-    for (const p of Object.values({ ...state.positions })) {
-      const x = results.find(z => z.symbol === p.symbol);
-      if (x) managePosition(p, x);
+    if (!LIVE) {
+      for (const p of Object.values({ ...state.positions })) {
+        const x = results.find(z => z.symbol === p.symbol);
+        if (x) managePosition(p, x);
+      }
     }
 
-    const chosen = Date.now() >= state.entryPauseUntil ? candidates.find(c => c.score >= CFG.minEdge && sideCount(c.side) < CFG.maxSameSide) : null;
-    if (chosen && Object.keys(state.positions).length < CFG.maxPositions) enter(chosen);
+    if (LIVE) {
+      await livePositionMode();
+      await manageLivePositions();
+      const dayLimit=Math.max(10,state.equity*LIVE_MAX_DAILY_LOSS_PCT);
+      if (dailyRealizedLive() <= -dayLimit) {
+        state.status = "LIVE_RISK_PAUSED";
+        state.lastError = `Límite diario LIVE alcanzado: ${dailyRealizedLive().toFixed(2)} USDT`;
+      } else {
+        let opened=0;
+        const usedSides={LONG:sideCount('LONG'),SHORT:sideCount('SHORT')};
+        for(const c of candidates){
+          if(Object.keys(state.positions).length>=CFG.maxPositions) break;
+          if(usedSides[c.side]>=CFG.maxSameSide) continue;
+          if(state.positions[c.symbol]) continue;
+          try{ if(await enterLive(c)){ usedSides[c.side]++; opened++; } }
+          catch(e){ state.lastError=e.message; logEvent('LIVE_ENTRY_ERROR',c.symbol,{message:e.message}); }
+        }
+        state.status = opened ? `LIVE_RUNNING · +${opened}` : "LIVE_RUNNING";
+      }
+      await syncLivePositions();
+    } else {
+      const chosen = candidates.find(c => c.score >= CFG.minEdge && sideCount(c.side) < CFG.maxSameSide);
+      if (chosen && Object.keys(state.positions).length < CFG.maxPositions) paperEnter(chosen);
+      state.status = "PAPER_RUNNING";
+    }
 
-    state.floatingPnl = Object.values(state.positions).reduce((sum, p) => {
-      const x = results.find(z => z.symbol === p.symbol);
-      if (!x) return sum;
-      p.markPrice = x.price;
-      return sum + (p.side === "LONG" ? (x.price - p.entry) * p.qty : (p.entry - x.price) * p.qty);
-    }, 0);
-    state.equity = state.cash + Object.values(state.positions).reduce((s, p) => s + p.allocation, 0) + state.floatingPnl;
+    if (!LIVE) {
+      state.floatingPnl = Object.values(state.positions).reduce((sum, p) => {
+        const x = results.find(z => z.symbol === p.symbol);
+        if (!x) return sum;
+        p.markPrice = x.price;
+        return sum + (p.side === "LONG" ? (x.price - p.entry) * p.qty : (p.entry - x.price) * p.qty);
+      }, 0);
+      state.equity = state.cash + Object.values(state.positions).reduce((s, p) => s + p.allocation, 0) + state.floatingPnl;
+    } else {
+      state.floatingPnl = Object.values(state.positions).reduce((sum,p)=>sum+Number(p.pnl||0),0);
+    }
     state.scans++;
     state.lastScan = new Date().toISOString();
     state.scanMs = Date.now() - started;
@@ -510,68 +743,72 @@ async function scan() {
   }
 }
 
-app.get("/health", (_q, res) => res.json({ ok: true, status: state.status, version: state.version, scanRunning: state.scanRunning }));
-app.get("/status", (_q, res) => res.json(state));
-app.post("/api/positions/:symbol/close", async (req, res) => {
-  const symbol = String(req.params.symbol || "").toUpperCase();
-  const p = state.positions[symbol];
-  if (!p) return res.status(404).json({ ok: false, error: "Posición no encontrada" });
-  try {
-    const price = await liveMarkPrice(symbol);
-    const result = closePositionAtPrice(p, price, "MANUAL");
-    state.floatingPnl = 0;
-    res.json({ ok: true, result, realizedPnl: state.realizedPnl });
-  } catch (e) {
-    res.status(502).json({ ok: false, error: e.message });
-  }
+app.get("/health", (_q, res) => {
+  res.set("Cache-Control","no-store");
+  res.json({ ok: true, status: state.status, version: state.version, mode: state.mode, live: LIVE, scanRunning: state.scanRunning, lastError: state.lastError });
+});
+app.get("/status", (_q, res) => {
+  res.set("Cache-Control","no-store");
+  res.json(state);
 });
 
-app.post("/api/positions/close-all", async (_req, res) => {
-  const positions = Object.values(state.positions);
-  if (!positions.length) return res.json({ ok: true, closed: [], message: "No hay posiciones abiertas" });
-  const closed = [], errors = [];
-  state.entryPauseUntil = Date.now() + CFG.pollMs * 2;
-  for (const p of positions) {
-    if (!state.positions[p.symbol]) continue;
-    try {
-      const price = await liveMarkPrice(p.symbol);
-      const result = closePositionAtPrice(p, price, "MANUAL_ALL");
-      if (result) closed.push(result);
-    } catch (e) {
-      errors.push({ symbol: p.symbol, error: e.message });
+app.post("/api/start", (_q,res)=>{ state.status=LIVE?"LIVE_RUNNING":"PAPER_RUNNING"; res.json({ok:true,mode:state.mode,status:state.status}); });
+app.post("/api/stop", (_q,res)=>{ state.status=LIVE?"LIVE_PAUSED":"PAPER_PAUSED"; res.json({ok:true,status:state.status}); });
+app.post("/api/close/:symbol", async (req,res)=>{
+  try{
+    const symbol=String(req.params.symbol||'').toUpperCase();
+    const p=state.positions[symbol];
+    if(!p) return res.status(404).json({ok:false,error:'Posición no encontrada'});
+    if(LIVE) await closeLivePosition(p,'MANUAL');
+    else {
+      const price=await binance('/fapi/v1/ticker/price?symbol='+encodeURIComponent(symbol));
+      const x=Number(price.price); const raw=p.side==='LONG'?(x-p.entry)*p.qty:(p.entry-x)*p.qty; const fees=p.allocation*CFG.feeRate+(p.allocation+raw)*CFG.feeRate; const pnl=raw-fees;
+      state.cash+=p.allocation+pnl; state.realizedPnl+=pnl; if(pnl>=0)state.stats.wins++;else state.stats.losses++; delete state.positions[symbol]; state.cooldown[symbol]=Date.now()+CFG.cooldownMs; logEvent('EXIT',symbol,{side:p.side,reason:'MANUAL',entry:p.entry,exit:x,pnl,fees});
     }
-  }
-  state.floatingPnl = 0;
-  res.json({ ok: errors.length === 0, closed, errors, realizedPnl: state.realizedPnl });
+    res.json({ok:true,symbol});
+  }catch(e){state.lastError=e.message;res.status(500).json({ok:false,error:e.message});}
+});
+app.post("/api/close-all", async (_q,res)=>{
+  try{ let closed=0; for(const p of Object.values({...state.positions})){ try{ if(LIVE) await closeLivePosition(p,'MANUAL_ALL'); else { const t=await binance('/fapi/v1/ticker/price?symbol='+encodeURIComponent(p.symbol)); const x=Number(t.price); const raw=p.side==='LONG'?(x-p.entry)*p.qty:(p.entry-x)*p.qty; const fees=p.allocation*CFG.feeRate+(p.allocation+raw)*CFG.feeRate; const pnl=raw-fees; state.cash+=p.allocation+pnl;state.realizedPnl+=pnl;if(pnl>=0)state.stats.wins++;else state.stats.losses++;delete state.positions[p.symbol]; } closed++; }catch(e){logEvent('CLOSE_ERROR',p.symbol,{message:e.message});} } res.json({ok:true,closed,remaining:Object.keys(state.positions).length}); }
+  catch(e){res.status(500).json({ok:false,error:e.message});}
+});
+app.get("/api/binance-check",async(_q,res)=>{
+  try{ const pub=await binance('/fapi/v1/ping'); let priv=null; if(API_KEY&&API_SECRET){ const a=await liveAccount(); priv={canTrade:a.canTrade,availableBalance:Number(a.availableBalance||0),totalWalletBalance:Number(a.totalWalletBalance||0),mode:await livePositionMode()}; } res.json({ok:true,live:LIVE,public:pub,private:priv,maxPositions:CFG.maxPositions,maxSameSide:CFG.maxSameSide,leverage:LIVE_LEVERAGE}); }
+  catch(e){state.lastError=e.message;res.status(502).json({ok:false,error:e.message,live:LIVE});}
 });
 
+app.get("/api/ready", (_q,res) => res.json({ok:true,service:"TIERRA",status:state.status,scans:state.scans,lastScan:state.lastScan,lastError:state.lastError,markets:state.markets,dataMarkets:state.dataMarkets}));
 
 app.get("/", (_q, res) => {
   res.send(`<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TIERRA · REAL-TIME MARKET INTELLIGENCE</title><style>
-body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;background:#080d13;color:#edf2f7;margin:0;padding:18px}h1{font-size:30px}.card{background:#111a24;border:1px solid #2a3b4e;border-radius:16px;padding:18px;margin:12px 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:12px}.big{font-size:27px;font-weight:800}.ok{color:#4ade80}.bad{color:#fb7185}.warn{color:#fbbf24}.muted{color:#94a3b8}.candidate{padding:12px 0;border-top:1px solid #253443;line-height:1.55}.tag{display:inline-block;padding:3px 7px;border-radius:8px;background:#1b2a39;margin:2px;font-size:12px}.position{margin:12px 0;padding:14px;border-radius:14px;border:1px solid #334155;background:#0d151e}.position.win{border-color:#16a34a;background:linear-gradient(90deg,rgba(22,163,74,.18),#0d151e)}.position.loss{border-color:#dc2626;background:linear-gradient(90deg,rgba(220,38,38,.18),#0d151e)}.position.flat{border-color:#64748b}.poshead{display:flex;justify-content:space-between;gap:10px;align-items:center;font-size:17px}.statepill{padding:5px 9px;border-radius:999px;font-weight:800;font-size:12px}.win .statepill{color:#4ade80;background:rgba(74,222,128,.12)}.loss .statepill{color:#fb7185;background:rgba(251,113,133,.12)}.flat .statepill{color:#cbd5e1;background:rgba(148,163,184,.12)}.posgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:12px 0}.posgrid>div{background:#111c27;border-radius:10px;padding:9px;font-size:12px;color:#94a3b8}.posgrid b{display:block;color:#f8fafc;font-size:14px;margin-top:3px}.win .posgrid div:nth-child(3),.win .posgrid div:nth-child(4){color:#4ade80}.loss .posgrid div:nth-child(3),.loss .posgrid div:nth-child(4){color:#fb7185}.pbar{height:10px;background:#1e293b;border-radius:999px;overflow:hidden;margin:10px 0}.pbar>div{height:100%;background:#4ade80;border-radius:999px}.loss .pbar>div{background:#fb7185}.flat .pbar>div{background:#94a3b8}.actions{display:flex;justify-content:flex-end;gap:8px;margin-bottom:10px}.btn{border:0;border-radius:10px;padding:9px 12px;font-weight:800;cursor:pointer}.btn-close{background:#7f1d1d;color:#fff}.btn-all{background:#991b1b;color:#fff}@media(max-width:700px){.posgrid{grid-template-columns:repeat(2,1fr)}}</style></head><body>
-<h1>🌎 TIERRA · REAL-TIME MARKET INTELLIGENCE</h1><div class="card"><b>🟡 PAPER · Binance USD-M público · TODO EL MERCADO</b><br>Escanea todos los perpetuos USDT. BTC/ETH son contexto; las monedas pequeñas también pueden ser seleccionadas.<br><b>Lead/Lag + Spot/Futures + OI + Funding + Taker Flow + Order Book + Técnica</b><br><span class="muted">No ejecuta dinero real y no garantiza beneficios.</span></div><div id="app">Cargando…</div><script>
-function esc(v){return String(v).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}function closeOne(symbol){
-  if(!confirm('¿Cerrar '+symbol+'?')) return;
-  fetch('/api/positions/'+encodeURIComponent(symbol)+'/close',{method:'POST'}).then(async r=>{const j=await r.json();if(!r.ok)throw new Error(j.error||'No se pudo cerrar');await load();}).catch(e=>alert(e.message));
-}
-function closeAll(){
-  const n=document.querySelectorAll('.position').length;
-  if(!n){alert('No hay posiciones abiertas.');return;}
-  if(!confirm('¿Cerrar TODAS las posiciones abiertas?')) return;
-  fetch('/api/positions/close-all',{method:'POST'}).then(async r=>{const j=await r.json();if(!r.ok)throw new Error(j.error||'No se pudieron cerrar todas');await load();if(j.errors?.length)alert('Cerradas: '+j.closed.length+' · con error: '+j.errors.length);}).catch(e=>alert(e.message));
-}
-
-async function load(){try{const ctrl=new AbortController();const timer=setTimeout(()=>ctrl.abort(),4000);const r=await fetch('/status',{cache:'no-store',signal:ctrl.signal});clearTimeout(timer);if(!r.ok)throw new Error('STATUS HTTP '+r.status);const s=await r.json();let h='<div class="grid">';h+='<div class="card"><div class="muted">ESTADO</div><div class="big">'+esc(s.status)+'</div><div>Scan '+s.scans+' · mercados '+s.dataMarkets+'/'+s.markets+' · '+s.scanMs+' ms</div></div>';h+='<div class="card"><div class="muted">EQUITY</div><div class="big">$'+Number(s.equity).toFixed(2)+'</div><div>Realizado $'+Number(s.realizedPnl).toFixed(2)+' · flotante $'+Number(s.floatingPnl).toFixed(2)+'</div></div>';h+='<div class="card"><div class="muted">BTC CONTEXTO</div><div>'+['1m','5m','15m','1h'].map(tf=>'<span class="tag">'+tf+': '+esc(s.marketContext?.[tf]||'—')+'</span>').join('')+'</div></div></div>';
+body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;background:#080d13;color:#edf2f7;margin:0;padding:18px}h1{font-size:30px}.card{background:#111a24;border:1px solid #2a3b4e;border-radius:16px;padding:18px;margin:12px 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:12px}.big{font-size:27px;font-weight:800}.ok{color:#4ade80}.bad{color:#fb7185}.warn{color:#fbbf24}.muted{color:#94a3b8}.candidate{padding:12px 0;border-top:1px solid #253443;line-height:1.55}.tag{display:inline-block;padding:3px 7px;border-radius:8px;background:#1b2a39;margin:2px;font-size:12px}.position{margin:12px 0;padding:14px;border-radius:14px;border:1px solid #334155;background:#0d151e}.position.win{border-color:#16a34a;background:linear-gradient(90deg,rgba(22,163,74,.18),#0d151e)}.position.loss{border-color:#dc2626;background:linear-gradient(90deg,rgba(220,38,38,.18),#0d151e)}.position.flat{border-color:#64748b}.poshead{display:flex;justify-content:space-between;gap:10px;align-items:center;font-size:17px}.statepill{padding:5px 9px;border-radius:999px;font-weight:800;font-size:12px}.win .statepill{color:#4ade80;background:rgba(74,222,128,.12)}.loss .statepill{color:#fb7185;background:rgba(251,113,133,.12)}.flat .statepill{color:#cbd5e1;background:rgba(148,163,184,.12)}.posgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:12px 0}.posgrid>div{background:#111c27;border-radius:10px;padding:9px;font-size:12px;color:#94a3b8}.posgrid b{display:block;color:#f8fafc;font-size:14px;margin-top:3px}.win .posgrid div:nth-child(3),.win .posgrid div:nth-child(4){color:#4ade80}.loss .posgrid div:nth-child(3),.loss .posgrid div:nth-child(4){color:#fb7185}.pbar{height:10px;background:#1e293b;border-radius:999px;overflow:hidden;margin:10px 0}.pbar>div{height:100%;background:#4ade80;border-radius:999px}.loss .pbar>div{background:#fb7185}.flat .pbar>div{background:#94a3b8}@media(max-width:700px){.posgrid{grid-template-columns:repeat(2,1fr)}}</style></head><body>
+<h1>🌎 TIERRA · REAL-TIME MARKET INTELLIGENCE</h1><div class="card"><b>⚙️ TIERRA · Binance USD-M · TODO EL MERCADO · <span id="modeBadge">${state.mode}</span></b><br>Escanea todos los perpetuos USDT. BTC/ETH son contexto; las monedas pequeñas también pueden ser seleccionadas.<br><b>Lead/Lag + Spot/Futures + OI + Funding + Taker Flow + Order Book + Técnica</b><br><span class="muted">LIVE solo si LIVE_TRADING=true. No garantiza beneficios.</span></div><div class="card"><button onclick="post('/api/start')">INICIAR</button><button onclick="post('/api/stop')">PAUSAR</button><button onclick="check()">PROBAR BINANCE</button><button onclick="closeAll()">CERRAR TODO</button></div><div id="app"><div class="card"><div class="muted">ESTADO DEL SERVIDOR</div><div class="big">${state.status}</div><div>Modo: <b>${state.mode}</b> · Escaneos: ${state.scans} · Mercados: ${state.markets}</div><div class="muted">Último scan: ${state.lastScan || "todavía no"}</div><p><a href="/status" style="color:#60a5fa">ABRIR /status (diagnóstico)</a> · <a href="/health" style="color:#60a5fa">/health</a></p><p id="liveUpdate">Conectando al estado en tiempo real…</p></div></div><script>
+async function post(u){await fetch(u,{method:"POST"});await load()}
+async function check(){alert(JSON.stringify(await (await fetch("/api/binance-check")).json(),null,2))}
+async function closeAll(){if(confirm("¿Cerrar todas las posiciones?")){await fetch("/api/close-all",{method:"POST"});await load()}}
+async function closeOne(sym){await fetch("/api/close/"+sym,{method:"POST"});await load()}
+function esc(v){return String(v).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}
+async function load(){try{const r=await fetch('/status?ts='+Date.now(),{cache:'no-store'});if(!r.ok)throw new Error('STATUS HTTP '+r.status);const s=await r.json();let h='<div class="grid">';h+='<div class="card"><div class="muted">ESTADO</div><div class="big">'+esc(s.status)+'</div><div>Scan '+s.scans+' · mercados '+s.dataMarkets+'/'+s.markets+' · '+s.scanMs+' ms</div></div>';h+='<div class="card"><div class="muted">EQUITY</div><div class="big">$'+Number(s.equity).toFixed(2)+'</div><div>Realizado $'+Number(s.realizedPnl).toFixed(2)+' · flotante $'+Number(s.floatingPnl).toFixed(2)+'</div></div>';h+='<div class="card"><div class="muted">BTC CONTEXTO</div><div>'+['1m','5m','15m','1h'].map(tf=>'<span class="tag">'+tf+': '+esc(s.marketContext?.[tf]||'—')+'</span>').join('')+'</div></div></div>';
 h+='<div class="card"><h2>Oportunidades detectadas en todo el mercado</h2>';if(!s.candidates.length)h+='<p class="warn">NO TRADE · no hay convergencia suficiente</p>';s.candidates.forEach(c=>{h+='<div class="candidate"><b>'+esc(c.symbol)+'</b> · <b>'+esc(c.side)+'</b> · EDGE <b>'+c.score+'</b> · '+esc(c.regime)+'<br>Tech '+c.techScore+' · Micro '+c.microScore+' · Lead/Lag '+c.leadLag+' · RSI '+Number(c.rsi).toFixed(1)+' · ADX '+Number(c.adx||0).toFixed(1)+' · RV '+Number(c.relVol||0).toFixed(2)+'x<br>OI Δ '+(c.oiDeltaPct==null?'—':c.oiDeltaPct+'%')+' · Funding '+(c.funding==null?'—':c.funding)+' · Basis '+(c.basisPct==null?'—':c.basisPct+'%')+' · Book '+(c.bookImbalance==null?'—':c.bookImbalance)+' · Taker '+(c.takerRatio==null?'—':c.takerRatio)+' · Spread '+(c.spreadBps==null?'—':c.spreadBps+' bps')+'<br><span class="muted">'+esc((c.reasons||[]).join(' · '))+'</span></div>'});h+='</div>';
-h+='<div class="card"><div class="actions"><button class="btn btn-all" onclick="closeAll()">✕ CERRAR TODAS</button></div><h2>Posiciones '+Object.keys(s.positions).length+'/4</h2>';const ps=Object.values(s.positions);if(!ps.length)h+='<p class="muted">Sin posiciones.</p>';ps.forEach(p=>{const gross=(p.side==='LONG'?(Number(p.markPrice||p.entry)-p.entry)*p.qty:(p.entry-Number(p.markPrice||p.entry))*p.qty);const estFees=p.allocation*0.0004;const net=gross-estFees;const pct=p.allocation?net/p.allocation*100:0;const cls=net>0.02?'win':net<-0.02?'loss':'flat';const label=net>0.02?'▲ GANANDO':net<-0.02?'▼ PERDIENDO':'● NEUTRAL';const width=Math.min(100,Math.max(0,50+pct*8));h+='<div class="position '+cls+'"><div class="poshead"><div><b>'+esc(p.symbol)+'</b> · <b>'+esc(p.side)+'</b></div><div style="display:flex;align-items:center;gap:8px"><div class="statepill">'+label+'</div><button class="btn btn-close" onclick="closeOne(\''+esc(p.symbol)+'\')">✕ CERRAR</button></div></div><div class="posgrid"><div>Entrada<br><b>'+Number(p.entry).toFixed(8)+'</b></div><div>Actual<br><b>'+Number(p.markPrice||p.entry).toFixed(8)+'</b></div><div>P&L neto<br><b>'+((net>=0?'+':'')+net.toFixed(2))+' USDT</b></div><div>Variación<br><b>'+((pct>=0?'+':'')+pct.toFixed(2))+'%</b></div></div><div class="pbar"><div style="width:'+width.toFixed(1)+'%"></div></div><div class="muted">SL '+Number(p.stop).toFixed(8)+' · TP '+Number(p.tp).toFixed(8)+' · '+esc((p.reasons||[]).join(' · '))+'</div></div>'});h+='</div>';
-h+='<div class="card"><b>Resultados:</b> '+s.stats.wins+' ganadoras · '+s.stats.losses+' perdedoras · LONG '+s.stats.long+' · SHORT '+s.stats.short+'<br><span class="muted">Último scan: '+esc(s.lastScan||'')+'</span></div>';document.getElementById('app').innerHTML=h}catch(e){document.getElementById('app').innerHTML='<div class="card bad"><b>Conexión con TIERRA:</b> '+esc(e.name==='AbortError'?'El servidor está ocupado analizando el mercado. Reintentando…':e.message)+'</div>'}}load();setInterval(load,3000);</script></body></html>`);
+h+='<div class="card"><h2>Posiciones '+Object.keys(s.positions).length+'/10</h2>';const ps=Object.values(s.positions);if(!ps.length)h+='<p class="muted">Sin posiciones.</p>';ps.forEach(p=>{const gross=(p.side==='LONG'?(Number(p.markPrice||p.entry)-p.entry)*p.qty:(p.entry-Number(p.markPrice||p.entry))*p.qty);const estFees=p.allocation*0.0004;const net=gross-estFees;const pct=p.allocation?net/p.allocation*100:0;const cls=net>0.02?'win':net<-0.02?'loss':'flat';const label=net>0.02?'▲ GANANDO':net<-0.02?'▼ PERDIENDO':'● NEUTRAL';const width=Math.min(100,Math.max(0,50+pct*8));h+='<div class="position '+cls+'"><div class="poshead"><div><b>'+esc(p.symbol)+'</b> · <b>'+esc(p.side)+'</b></div><div class="statepill">'+label+'</div></div><div class="posgrid"><div>Entrada<br><b>'+Number(p.entry).toFixed(8)+'</b></div><div>Actual<br><b>'+Number(p.markPrice||p.entry).toFixed(8)+'</b></div><div>P&L neto<br><b>'+((net>=0?'+':'')+net.toFixed(2))+' USDT</b></div><div>Variación<br><b>'+((pct>=0?'+':'')+pct.toFixed(2))+'%</b></div></div><div class="pbar"><div style="width:'+width.toFixed(1)+'%"></div></div><div class="muted">SL '+Number(p.stop).toFixed(8)+' · TP '+Number(p.tp).toFixed(8)+' · '+esc((p.reasons||[]).join(' · '))+'</div></div>'});h+='</div>';
+h+='<div class="card"><b>Resultados:</b> '+s.stats.wins+' ganadoras · '+s.stats.losses+' perdedoras · LONG '+s.stats.long+' · SHORT '+s.stats.short+'<br><span class="muted">Último scan: '+esc(s.lastScan||'')+'</span></div>';document.getElementById('app').innerHTML=h;document.getElementById('liveUpdate')?.remove()}catch(e){const el=document.getElementById('liveUpdate');if(el)el.textContent='Diagnóstico: '+e.message;console.error(e)}}load();setInterval(load,5000);</script></body></html>`);
 });
 
+async function mainLoop(){
+  try{ await scan(); }
+  catch(e){ state.lastError=e.message; logEvent("SCAN_ERROR",null,{message:e.message}); }
+  setTimeout(mainLoop, CFG.pollMs);
+}
+
 app.listen(PORT,"0.0.0.0",()=>{
-  console.log("TIERRA listening on "+PORT);
-  setTimeout(()=>scan().catch(e=>logEvent("START_SCAN_ERROR",null,{message:e.message})).finally(function loop(){
-    setTimeout(()=>scan().catch(e=>logEvent("SCAN_ERROR",null,{message:e.message})).finally(loop),CFG.pollMs);
-  }),1000);
+  console.log(`TIERRA listening on ${PORT} | MODE=${LIVE?'LIVE':'PAPER'} | MAX=${CFG.maxPositions}`);
+  if(LIVE && (!API_KEY || !API_SECRET)) console.error('LIVE_TRADING=true pero faltan BINANCE_API_KEY/BINANCE_API_SECRET');
+  setTimeout(async ()=>{
+    try {
+      if(LIVE){ await livePositionMode(); await syncLivePositions(); }
+      await mainLoop();
+    } catch(e) { state.lastError=e.message; logEvent("START_ERROR",null,{message:e.message}); setTimeout(mainLoop,5000); }
+  }, 1500);
 });
 process.on("uncaughtException",e=>console.error("UNCAUGHT_EXCEPTION",e));
 process.on("unhandledRejection",e=>console.error("UNHANDLED_REJECTION",e));
