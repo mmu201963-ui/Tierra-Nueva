@@ -18,7 +18,7 @@ const CFG = {
 };
 
 const state = {
-  version: "TIERRA REAL-TIME MARKET INTELLIGENCE",
+  version: "SUPREMO V13 MARKET MICROSTRUCTURE + LEAD/LAG",
   mode: "PAPER",
   status: "STARTING",
   markets: 0,
@@ -51,7 +51,7 @@ async function fetchJson(url, timeout = 10000) {
   const c = new AbortController();
   const t = setTimeout(() => c.abort(), timeout);
   try {
-    const r = await fetch(url, { signal: c.signal, headers: { "User-Agent": "TIERRA-PAPER" } });
+    const r = await fetch(url, { signal: c.signal, headers: { "User-Agent": "SUPREMO-V13" } });
     const text = await r.text();
     if (!r.ok) throw new Error("HTTP " + r.status + " " + text.slice(0, 160));
     return JSON.parse(text);
@@ -69,14 +69,6 @@ async function binance(path) {
 
 async function spot(path) {
   return fetchJson("https://api.binance.com" + path);
-}
-
-async function livePrice(symbol) {
-  const q = encodeURIComponent(symbol);
-  const d = await binance(`/fapi/v1/ticker/price?symbol=${q}`);
-  const price = +d.price;
-  if (!Number.isFinite(price) || price <= 0) throw new Error("invalid live price");
-  return price;
 }
 
 function ema(values, period) {
@@ -411,9 +403,21 @@ function enter(c) {
   return true;
 }
 
-function closePositionAtPrice(p, price, reason) {
-  if (!p || !Number.isFinite(price) || price <= 0) return null;
-  const raw = p.side === "LONG" ? (price - p.entry) * p.qty : (p.entry - price) * p.qty;
+function managePosition(p, x) {
+  const age = Date.now() - p.openedAt;
+  let reason = null;
+  if (p.side === "LONG") {
+    if (x.price <= p.stop) reason = "STOP";
+    else if (x.price >= p.tp) reason = "TP";
+    else if (x.regime === "BEAR" && x.ema20 < x.ema50) reason = "REGIME_FLIP";
+  } else {
+    if (x.price >= p.stop) reason = "STOP";
+    else if (x.price <= p.tp) reason = "TP";
+    else if (x.regime === "BULL" && x.ema20 > x.ema50) reason = "REGIME_FLIP";
+  }
+  if (age >= CFG.maxHoldMs && !reason) reason = "TIME";
+  if (!reason) return;
+  const raw = p.side === "LONG" ? (x.price - p.entry) * p.qty : (p.entry - x.price) * p.qty;
   const fees = p.allocation * CFG.feeRate + (p.allocation + raw) * CFG.feeRate;
   const pnl = raw - fees;
   state.cash += p.allocation + pnl;
@@ -421,27 +425,7 @@ function closePositionAtPrice(p, price, reason) {
   if (pnl >= 0) state.stats.wins++; else state.stats.losses++;
   delete state.positions[p.symbol];
   state.cooldown[p.symbol] = Date.now() + CFG.cooldownMs;
-  logEvent("EXIT", p.symbol, { side: p.side, reason, entry: p.entry, exit: price, pnl, fees, ageMs: Date.now() - p.openedAt });
-  return { symbol: p.symbol, side: p.side, entry: p.entry, exit: price, pnl, fees, reason };
-}
-
-function managePosition(p, x) {
-  const age = Date.now() - p.openedAt;
-  const price = Number.isFinite(p.livePrice) ? p.livePrice : x.price;
-  let reason = null;
-  if (p.side === "LONG") {
-    if (price <= p.stop) reason = "STOP";
-    else if (price >= p.tp) reason = "TP";
-    else if (x.regime === "BEAR" && x.ema20 < x.ema50) reason = "REGIME_FLIP";
-  } else {
-    if (price >= p.stop) reason = "STOP";
-    else if (price <= p.tp) reason = "TP";
-    else if (x.regime === "BULL" && x.ema20 > x.ema50) reason = "REGIME_FLIP";
-  }
-
-  if (age >= CFG.maxHoldMs && !reason) reason = "TIME";
-  if (!reason) return false;
-  return !!closePositionAtPrice(p, price, reason);
+  logEvent("EXIT", p.symbol, { side: p.side, reason, entry: p.entry, exit: x.price, pnl, fees });
 }
 
 async function scan() {
@@ -488,32 +472,18 @@ async function scan() {
       quoteVol: x.quoteVol, reasons: x.reasons || []
     }));
 
-    const openPositions = Object.values({ ...state.positions });
-    const livePrices = await Promise.all(openPositions.map(async p => {
-      try { return [p.symbol, await livePrice(p.symbol)]; }
-      catch { return [p.symbol, null]; }
-    }));
-    const liveMap = new Map(livePrices);
-    for (const p of openPositions) {
+    for (const p of Object.values({ ...state.positions })) {
       const x = results.find(z => z.symbol === p.symbol);
-      if (x) {
-        const lp = liveMap.get(p.symbol);
-        if (Number.isFinite(lp)) p.livePrice = lp;
-        managePosition(p, x);
-      }
+      if (x) managePosition(p, x);
     }
 
-    // Tras cerrar una posición por la revisión de 30 s, se busca inmediatamente
-    // el siguiente candidato válido. Nunca se fuerza una entrada si no hay señal.
     const chosen = candidates.find(c => c.score >= CFG.minEdge && sideCount(c.side) < CFG.maxSameSide);
     if (chosen && Object.keys(state.positions).length < CFG.maxPositions) enter(chosen);
 
     state.floatingPnl = Object.values(state.positions).reduce((sum, p) => {
       const x = results.find(z => z.symbol === p.symbol);
       if (!x) return sum;
-      const mark = Number.isFinite(p.livePrice) ? p.livePrice : x.price;
-      p.markPrice = mark;
-      return sum + (p.side === "LONG" ? (mark - p.entry) * p.qty : (p.entry - mark) * p.qty);
+      return sum + (p.side === "LONG" ? (x.price - p.entry) * p.qty : (p.entry - x.price) * p.qty);
     }, 0);
     state.equity = state.cash + Object.values(state.positions).reduce((s, p) => s + p.allocation, 0) + state.floatingPnl;
     state.scans++;
@@ -525,47 +495,20 @@ async function scan() {
   }
 }
 
-app.post("/api/positions/:symbol/close", async (req, res) => {
-  const symbol = String(req.params.symbol || "").toUpperCase();
-  const p = state.positions[symbol];
-  if (!p) return res.status(404).json({ ok: false, error: "POSITION_NOT_FOUND" });
-  if (p.manualClosing) return res.status(409).json({ ok: false, error: "POSITION_ALREADY_CLOSING" });
-  p.manualClosing = true;
-  try {
-    const price = await livePrice(symbol);
-    const result = closePositionAtPrice(p, price, "MANUAL_BUTTON");
-    if (!result) return res.status(500).json({ ok: false, error: "CLOSE_FAILED" });
-    return res.json({ ok: true, result, equity: state.equity, realizedPnl: state.realizedPnl });
-  } catch (e) {
-    p.manualClosing = false;
-    return res.status(502).json({ ok: false, error: "LIVE_PRICE_ERROR", message: e.message });
-  }
-});
-
 app.get("/health", (_q, res) => res.json({ ok: true, status: state.status, version: state.version, scanRunning: state.scanRunning }));
 app.get("/status", (_q, res) => res.json(state));
 
 app.get("/", (_q, res) => {
-  res.send(`<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TIERRA · REAL-TIME MARKET INTELLIGENCE</title><style>
-body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;background:#080d13;color:#edf2f7;margin:0;padding:18px}h1{font-size:30px}.card{background:#111a24;border:1px solid #2a3b4e;border-radius:16px;padding:18px;margin:12px 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:12px}.big{font-size:27px;font-weight:800}.ok{color:#4ade80}.bad{color:#fb7185}.warn{color:#fbbf24}.muted{color:#94a3b8}.candidate{padding:12px 0;border-top:1px solid #253443;line-height:1.55}.tag{display:inline-block;padding:3px 7px;border-radius:8px;background:#1b2a39;margin:2px;font-size:12px}.position{margin:12px 0;padding:14px;border-radius:14px;border:1px solid #334155;background:#0d151e}.position.win{border-color:#16a34a;background:linear-gradient(90deg,rgba(22,163,74,.18),#0d151e)}.position.loss{border-color:#dc2626;background:linear-gradient(90deg,rgba(220,38,38,.18),#0d151e)}.position.flat{border-color:#64748b}.poshead{display:flex;justify-content:space-between;gap:10px;align-items:center;font-size:17px}.closebtn{border:0;border-radius:10px;padding:9px 12px;font-weight:800;background:#ef4444;color:white;cursor:pointer}.closebtn:disabled{opacity:.55;cursor:wait}.statepill{padding:5px 9px;border-radius:999px;font-weight:800;font-size:12px}.win .statepill{color:#4ade80;background:rgba(74,222,128,.12)}.loss .statepill{color:#fb7185;background:rgba(251,113,133,.12)}.flat .statepill{color:#cbd5e1;background:rgba(148,163,184,.12)}.posgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:12px 0}.posgrid>div{background:#111c27;border-radius:10px;padding:9px;font-size:12px;color:#94a3b8}.posgrid b{display:block;color:#f8fafc;font-size:14px;margin-top:3px}.win .posgrid div:nth-child(3),.win .posgrid div:nth-child(4){color:#4ade80}.loss .posgrid div:nth-child(3),.loss .posgrid div:nth-child(4){color:#fb7185}.pbar{height:10px;background:#1e293b;border-radius:999px;overflow:hidden;margin:10px 0}.pbar>div{height:100%;background:#4ade80;border-radius:999px}.loss .pbar>div{background:#fb7185}.flat .pbar>div{background:#94a3b8}@media(max-width:700px){.posgrid{grid-template-columns:repeat(2,1fr)}}</style></head><body>
-<h1>🌎 TIERRA · REAL-TIME MARKET INTELLIGENCE</h1><div class="card"><b>🟡 PAPER · Binance USD-M público · TODO EL MERCADO</b><br>Escanea todos los perpetuos USDT. BTC/ETH son contexto; las monedas pequeñas también pueden ser seleccionadas.<br><b>Lead/Lag + Spot/Futures + OI + Funding + Taker Flow + Order Book + Técnica</b><br><span class="muted">No ejecuta dinero real y no garantiza beneficios.</span></div><div id="app">Cargando…</div><script>
+  res.send(`<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SUPREMO V13</title><style>
+body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;background:#080d13;color:#edf2f7;margin:0;padding:18px}h1{font-size:30px}.card{background:#111a24;border:1px solid #2a3b4e;border-radius:16px;padding:18px;margin:12px 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:12px}.big{font-size:27px;font-weight:800}.ok{color:#4ade80}.bad{color:#fb7185}.warn{color:#fbbf24}.muted{color:#94a3b8}.candidate{padding:12px 0;border-top:1px solid #253443;line-height:1.55}.tag{display:inline-block;padding:3px 7px;border-radius:8px;background:#1b2a39;margin:2px;font-size:12px}</style></head><body>
+<h1>SUPREMO V13 · MARKET MICROSTRUCTURE</h1><div class="card"><b>PAPER · Binance USD-M público · TODO EL MERCADO</b><br>Escanea todos los perpetuos USDT. BTC/ETH son contexto; las monedas pequeñas también pueden ser seleccionadas.<br><b>Lead/Lag + Spot/Futures + OI + Funding + Taker Flow + Order Book + Técnica</b><br><span class="muted">No ejecuta dinero real y no garantiza beneficios.</span></div><div id="app">Cargando…</div><script>
 function esc(v){return String(v).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}
-async function manualClose(symbol){
-  if(!confirm('¿Cerrar manualmente '+symbol+'?')) return;
-  try {
-    const r=await fetch('/api/positions/'+encodeURIComponent(symbol)+'/close',{method:'POST'});
-    const d=await r.json();
-    if(!r.ok) throw new Error(d.error||d.message||'No se pudo cerrar');
-    alert('Cerrada '+symbol+' · P&L '+(d.result.pnl>=0?'+':'')+Number(d.result.pnl).toFixed(2)+' USDT');
-    await load();
-  } catch(e){ alert('Error al cerrar '+symbol+': '+e.message); await load(); }
-}
 async function load(){try{const s=await (await fetch('/status',{cache:'no-store'})).json();let h='<div class="grid">';h+='<div class="card"><div class="muted">ESTADO</div><div class="big">'+esc(s.status)+'</div><div>Scan '+s.scans+' · mercados '+s.dataMarkets+'/'+s.markets+' · '+s.scanMs+' ms</div></div>';h+='<div class="card"><div class="muted">EQUITY</div><div class="big">$'+Number(s.equity).toFixed(2)+'</div><div>Realizado $'+Number(s.realizedPnl).toFixed(2)+' · flotante $'+Number(s.floatingPnl).toFixed(2)+'</div></div>';h+='<div class="card"><div class="muted">BTC CONTEXTO</div><div>'+['1m','5m','15m','1h'].map(tf=>'<span class="tag">'+tf+': '+esc(s.marketContext?.[tf]||'—')+'</span>').join('')+'</div></div></div>';
 h+='<div class="card"><h2>Oportunidades detectadas en todo el mercado</h2>';if(!s.candidates.length)h+='<p class="warn">NO TRADE · no hay convergencia suficiente</p>';s.candidates.forEach(c=>{h+='<div class="candidate"><b>'+esc(c.symbol)+'</b> · <b>'+esc(c.side)+'</b> · EDGE <b>'+c.score+'</b> · '+esc(c.regime)+'<br>Tech '+c.techScore+' · Micro '+c.microScore+' · Lead/Lag '+c.leadLag+' · RSI '+Number(c.rsi).toFixed(1)+' · ADX '+Number(c.adx||0).toFixed(1)+' · RV '+Number(c.relVol||0).toFixed(2)+'x<br>OI Δ '+(c.oiDeltaPct==null?'—':c.oiDeltaPct+'%')+' · Funding '+(c.funding==null?'—':c.funding)+' · Basis '+(c.basisPct==null?'—':c.basisPct+'%')+' · Book '+(c.bookImbalance==null?'—':c.bookImbalance)+' · Taker '+(c.takerRatio==null?'—':c.takerRatio)+' · Spread '+(c.spreadBps==null?'—':c.spreadBps+' bps')+'<br><span class="muted">'+esc((c.reasons||[]).join(' · '))+'</span></div>'});h+='</div>';
-h+='<div class="card"><h2>Posiciones '+Object.keys(s.positions).length+'/4</h2>';const ps=Object.values(s.positions);if(!ps.length)h+='<p class="muted">Sin posiciones.</p>';ps.forEach(p=>{const gross=(p.side==='LONG'?(Number(p.markPrice||p.entry)-p.entry)*p.qty:(p.entry-Number(p.markPrice||p.entry))*p.qty);const estFees=p.allocation*0.0004;const net=gross-estFees;const pct=p.allocation?net/p.allocation*100:0;const cls=net>0.02?'win':net<-0.02?'loss':'flat';const label=net>0.02?'▲ GANANDO':net<-0.02?'▼ PERDIENDO':'● NEUTRAL';const width=Math.min(100,Math.max(0,50+pct*8));h+='<div class="position '+cls+'"><div class="poshead"><div><b>'+esc(p.symbol)+'</b> · <b>'+esc(p.side)+'</b></div><div style="display:flex;align-items:center;gap:8px"><div class="statepill">'+label+'</div><button class="closebtn" onclick="manualClose(\''+esc(p.symbol)+\'\')" '+(p.manualClosing?'disabled':'')+'>'+ (p.manualClosing?'CERRANDO…':'✕ CERRAR') +'</button></div></div><div class="posgrid"><div>Entrada<br><b>'+Number(p.entry).toFixed(8)+'</b></div><div>Actual<br><b>'+Number(p.markPrice||p.entry).toFixed(8)+'</b></div><div>P&L neto<br><b>'+((net>=0?'+':'')+net.toFixed(2))+' USDT</b></div><div>Variación<br><b>'+((pct>=0?'+':'')+pct.toFixed(2))+'%</b></div></div><div class="pbar"><div style="width:'+width.toFixed(1)+'%"></div></div><div class="muted">SL '+Number(p.stop).toFixed(8)+' · TP '+Number(p.tp).toFixed(8)+' · '+esc((p.reasons||[]).join(' · '))+'</div></div>'});h+='</div>';
+h+='<div class="card"><h2>Posiciones '+Object.keys(s.positions).length+'/4</h2>';const ps=Object.values(s.positions);if(!ps.length)h+='<p class="muted">Sin posiciones.</p>';ps.forEach(p=>{h+='<div class="candidate"><b>'+esc(p.symbol)+'</b> · '+esc(p.side)+' · entrada '+Number(p.entry).toFixed(6)+' · EDGE '+p.score+'<br><span class="muted">'+esc((p.reasons||[]).join(' · '))+'</span></div>'});h+='</div>';
 h+='<div class="card"><b>Resultados:</b> '+s.stats.wins+' ganadoras · '+s.stats.losses+' perdedoras · LONG '+s.stats.long+' · SHORT '+s.stats.short+'<br><span class="muted">Último scan: '+esc(s.lastScan||'')+'</span></div>';document.getElementById('app').innerHTML=h}catch(e){document.getElementById('app').innerHTML='<div class="card bad">'+esc(e.message)+'</div>'}}load();setInterval(load,5000);</script></body></html>`);
 });
 
-app.listen(PORT,"0.0.0.0",()=>{console.log("TIERRA listening on "+PORT);scan().catch(e=>logEvent("START_SCAN_ERROR",null,{message:e.message})).finally(function loop(){setTimeout(()=>scan().catch(e=>logEvent("SCAN_ERROR",null,{message:e.message})).finally(loop),CFG.pollMs);});});
+app.listen(PORT,"0.0.0.0",()=>{console.log("SUPREMO V13 listening on "+PORT);scan().catch(e=>logEvent("START_SCAN_ERROR",null,{message:e.message})).finally(function loop(){setTimeout(()=>scan().catch(e=>logEvent("SCAN_ERROR",null,{message:e.message})).finally(loop),CFG.pollMs);});});
 process.on("uncaughtException",e=>console.error("UNCAUGHT_EXCEPTION",e));
 process.on("unhandledRejection",e=>console.error("UNHANDLED_REJECTION",e));

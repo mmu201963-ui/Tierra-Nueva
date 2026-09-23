@@ -1,40 +1,35 @@
-# TIERRA — Real-Time Market Intelligence
+# SUPREMO V13 — MARKET MICROSTRUCTURE + LEAD/LAG
 
-Bot PAPER para Binance USD-M Futures. Escanea el mercado USDT y mantiene posiciones simuladas.
+PAPER only. No Binance API keys required.
 
-## Cambio de esta versión
+## Qué cambia
+- Escanea TODO el universo de perpetuos USD-M USDT disponibles en Binance.
+- BTC es contexto de mercado, no un filtro que limite las monedas candidatas.
+- Añade análisis multi-timeframe de BTC: 1m/5m/15m/1h.
+- Añade lead/lag para buscar movimientos que comienzan sin perseguir spikes excesivos.
+- Enriquece las mejores candidatas de TODO el mercado con:
+  - Open Interest y cambio de OI.
+  - Funding.
+  - Precio Spot vs Futures (basis/premium simple).
+  - Order book imbalance y spread.
+  - Taker buy/sell flow.
+- Mantiene indicadores técnicos de V12.2 como capa secundaria.
+- Coste PAPER configurable: comisión y slippage estimados.
+- Máximo 4 posiciones y máximo 2 por dirección.
+- Una entrada por ciclo.
+- Evita escaneos solapados: el siguiente ciclo empieza después de terminar el anterior.
+- No invierte automáticamente LONG/SHORT.
 
-Cada posición tiene un botón **✕ CERRAR** en su propia ventana.
+## Importante
+La capa de arbitraje se utiliza como **señal relativa/lead-lag**, no como arbitraje ejecutado. El bot no abre dos patas Spot/Futures ni garantiza una ganancia de arbitraje.
 
-- El cierre manual usa el precio en vivo de Binance.
-- Calcula P&L y comisiones simuladas.
-- Registra el motivo `MANUAL_BUTTON`.
-- Libera inmediatamente el slot de la posición.
-- La moneda entra en cooldown para evitar una reapertura inmediata.
-- El bot continúa buscando oportunidades en el siguiente ciclo.
-- Se eliminó la regla automática de cierre por pérdida a los 30 segundos; el usuario decide cuándo cerrar manualmente, mientras SL/TP/cambio de régimen/tiempo máximo siguen activos.
+Esta versión sigue siendo PAPER y no garantiza beneficios. La finalidad es medir si la información de microestructura y lead/lag mejora la selección frente a V12.2 antes de considerar cualquier operación real.
 
-## Seguridad
-
-- **PAPER solamente**.
-- No utiliza API keys de Binance.
-- No coloca órdenes reales.
-- No garantiza beneficios.
-
-## Instalación
-
-```bash
-npm install
-npm start
-```
+## Railway
+Start Command: `npm start`
 
 Variables opcionales:
-
-- `PORT` — puerto HTTP.
-- `INITIAL_CAPITAL` — capital PAPER inicial; por defecto `10000`.
-- `PAPER_FEE_RATE` — comisión simulada; por defecto `0.0004`.
-- `PAPER_SLIPPAGE_BPS` — slippage simulado; por defecto `3` bps.
-
-## Interfaz
-
-Cada tarjeta de posición muestra entrada, precio actual, P&L, variación, barra visual y los botones de estado/cierre. Verde = positivo, rojo = negativo y gris = neutral.
+- `PORT`
+- `INITIAL_CAPITAL` (default 10000)
+- `PAPER_FEE_RATE` (default 0.0004)
+- `PAPER_SLIPPAGE_BPS` (default 3)
