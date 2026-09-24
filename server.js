@@ -1,6 +1,6 @@
 const express = require("express");
 const app = express();
-const PORT = Number(process.env.PORT || 8080);
+const PORT = Number(process.env.PORT || 3000);
 
 const CFG = {
   maxPositions: 10,
@@ -18,7 +18,7 @@ const CFG = {
 };
 
 const state = {
-  version: "TIERRA REAL-TIME MARKET INTELLIGENCE",
+  version: "TIERRA-FIBONACCI-1.5",
   mode: "PAPER",
   status: "STARTING",
   markets: 0,
@@ -200,6 +200,69 @@ function regime(x) {
   return "RANGE";
 }
 
+
+function fibonacciStructure(klines) {
+  const a = klines.slice(-60);
+  if (a.length < 30) return null;
+  let hi = -Infinity, lo = Infinity, hiI = -1, loI = -1;
+  for (let i = 0; i < a.length; i++) {
+    const h = +a[i][2], l = +a[i][3];
+    if (h > hi) { hi = h; hiI = i; }
+    if (l < lo) { lo = l; loI = i; }
+  }
+  const range = hi - lo;
+  if (!(range > 0) || !Number.isFinite(hi) || !Number.isFinite(lo)) return null;
+  const bullSwing = loI < hiI;
+  const r = {
+    high: hi, low: lo, range, bullSwing,
+    r382: bullSwing ? hi - range * 0.382 : lo + range * 0.382,
+    r500: bullSwing ? hi - range * 0.500 : lo + range * 0.500,
+    r618: bullSwing ? hi - range * 0.618 : lo + range * 0.618,
+    r786: bullSwing ? hi - range * 0.786 : lo + range * 0.786,
+    e1272: bullSwing ? hi + range * 0.272 : lo - range * 0.272,
+    e1618: bullSwing ? hi + range * 0.618 : lo - range * 0.618
+  };
+  return r;
+}
+
+function fibonacciScore(x, side) {
+  const f = x.fib;
+  if (!f || !Number.isFinite(f.range) || f.range <= 0) return { score: 0, zone: 'NONE', reasons: [] };
+  const p = x.price;
+  const atrPct = x.atr / p;
+  const tol = Math.max(x.atr * 0.35, f.range * 0.025);
+  let score = 0, zone = 'NONE', reasons = [];
+  const inLongZone = p <= f.r382 + tol && p >= f.r786 - tol;
+  const inShortZone = p >= f.r382 - tol && p <= f.r786 + tol;
+  if (side === 'LONG') {
+    if (f.bullSwing && inLongZone) {
+      const d = Math.abs(p - f.r618);
+      score += Math.max(0, 2.2 - (d / Math.max(tol, f.range * 0.18)) * 1.4);
+      zone = d <= tol ? 'FIB-0.618' : p >= f.r382 ? 'FIB-0.382/0.500' : 'FIB-0.786';
+      reasons.push(zone);
+      if (p < f.r786) score -= 1.2;
+    } else if (f.bullSwing && p > f.r382 + tol) {
+      score -= 1.0; zone = 'EXTENDED'; reasons.push('FIB EXTENDED');
+    } else if (!f.bullSwing) {
+      score -= 0.6; reasons.push('FIB AGAINST SWING');
+    }
+  } else {
+    if (!f.bullSwing && inShortZone) {
+      const d = Math.abs(p - f.r618);
+      score += Math.max(0, 2.2 - (d / Math.max(tol, f.range * 0.18)) * 1.4);
+      zone = d <= tol ? 'FIB-0.618' : p <= f.r382 ? 'FIB-0.382/0.500' : 'FIB-0.786';
+      reasons.push(zone);
+      if (p > f.r786) score -= 1.2;
+    } else if (!f.bullSwing && p < f.r382 - tol) {
+      score -= 1.0; zone = 'EXTENDED'; reasons.push('FIB EXTENDED');
+    } else if (f.bullSwing) {
+      score -= 0.6; reasons.push('FIB AGAINST SWING');
+    }
+  }
+  if (atrPct > 0.03) score -= 0.4;
+  return { score, zone, reasons };
+}
+
 function technicalScore(x, side) {
   let s = 0;
   const up = x.ema20 > x.ema50, down = x.ema20 < x.ema50;
@@ -246,9 +309,11 @@ async function analyzeSymbol(symbol) {
   const closed = ks.slice(0, -1), closes = closed.map(k => +k[4]), price = +closed.at(-1)[4];
   const e20 = ema(closes, 20), e50 = ema(closes, 50), e20Prev = ema(closes.slice(0, -1), 20);
   const a = atr(closed, 14), r = rsi(closes, 14), rv = relativeVolume(closed, 20);
+  const fib = fibonacciStructure(closed);
   const momentum = closes.at(-1) - closes.at(-6), mc = macd(closes), stoch = stochastic(closed, 14), ob = obv(closed), obPrev = obv(closed.slice(0, -5)), ax = adx(closed, 14), bb = bollinger(closes, 20, 2);
   if (![price, e20, e50, e20Prev, a, r, rv, momentum, stoch, ob, ax].every(Number.isFinite) || !mc || !Number.isFinite(mc.line) || !Number.isFinite(mc.signal) || !bb) throw new Error("invalid data");
   const x = { symbol, price, ema20: e20, ema50: e50, ema20Prev: e20Prev, atr: a, rsi: r, relVol: rv, momentum, macd: mc.line, macdSignal: mc.signal, macdHist: mc.hist, stoch, obv: ob, obvSlope: Number.isFinite(obPrev) ? ob - obPrev : 0, adx: ax, bbMiddle: bb.middle, bbUpper: bb.upper, bbLower: bb.lower };
+  x.fib = fib;
   x.regime = regime(x); x.longTech = technicalScore(x, "LONG"); x.shortTech = technicalScore(x, "SHORT");
   return x;
 }
@@ -357,10 +422,11 @@ function finalCandidate(x, side, liquidity) {
   const tech = side === "LONG" ? x.longTech : x.shortTech;
   const micro = microScore(x, side);
   const lead = leadLagScore(x, side);
+  const fib = fibonacciScore(x, side);
   const liq = liquidity && liquidity.quoteVol > 0 ? (liquidity.quoteVol >= 5e6 ? .8 : liquidity.quoteVol >= 1e6 ? .4 : liquidity.quoteVol >= 2e5 ? 0 : -.8) : 0;
   const spreadPenalty = Number.isFinite(x.spreadBps) ? (x.spreadBps > 20 ? -1.2 : x.spreadBps > 10 ? -.5 : .3) : 0;
-  const edge = tech + micro.score + lead + liq + spreadPenalty;
-  return { ...x, side, score: edge, techScore: tech, microScore: micro.score, leadLag: lead, reasons: micro.reasons, quoteVol: liquidity?.quoteVol || 0, change24: liquidity?.change24 || 0 };
+  const edge = tech + micro.score + lead + fib.score + liq + spreadPenalty;
+  return { ...x, side, score: edge, techScore: tech, microScore: micro.score, leadLag: lead, fibScore: fib.score, fibZone: fib.zone, fibReasons: fib.reasons, reasons: [...micro.reasons, ...fib.reasons], quoteVol: liquidity?.quoteVol || 0, change24: liquidity?.change24 || 0 };
 }
 
 function bestCandidates(results, liquidityMap) {
@@ -388,18 +454,32 @@ function enter(c) {
   if (allocation <= 0) return false;
   const slip = CFG.slippageBps / 10000;
   const entry = c.side === "LONG" ? c.price * (1 + slip) : c.price * (1 - slip);
-  const stopDist = Math.max(c.atr * 1.6, c.price * 0.007);
-  const tpDist = stopDist * 1.9;
+  const f = c.fib;
+  const atrStop = c.atr * 1.35;
+  let stopDist = Math.max(atrStop, c.price * 0.0055);
+  let stop = c.side === "LONG" ? entry - stopDist : entry + stopDist;
+  let tp;
+  if (f && Number.isFinite(f.range) && f.range > 0) {
+    const fibStop = c.side === "LONG" ? f.r786 - c.atr * 0.20 : f.r786 + c.atr * 0.20;
+    if (c.side === "LONG" && fibStop < entry && entry - fibStop <= c.atr * 2.5) stop = Math.min(stop, fibStop);
+    if (c.side === "SHORT" && fibStop > entry && fibStop - entry <= c.atr * 2.5) stop = Math.max(stop, fibStop);
+    const ext = c.side === "LONG" ? (f.e1272 > entry ? f.e1272 : f.e1618) : (f.e1272 < entry ? f.e1272 : f.e1618);
+    const minTp = c.side === "LONG" ? entry + stopDist * 1.65 : entry - stopDist * 1.65;
+    tp = c.side === "LONG" ? Math.max(ext, minTp) : Math.min(ext, minTp);
+  } else {
+    const tpDist = stopDist * 1.8;
+    tp = c.side === "LONG" ? entry + tpDist : entry - tpDist;
+  }
   state.positions[c.symbol] = {
     symbol: c.symbol, side: c.side, entry, qty: allocation / entry, allocation,
-    stop: c.side === "LONG" ? entry - stopDist : entry + stopDist,
-    tp: c.side === "LONG" ? entry + tpDist : entry - tpDist,
-    openedAt: Date.now(), score: c.score, regime: c.regime,
+    stop, tp, openedAt: Date.now(), score: c.score, regime: c.regime,
+    fibZone: c.fibZone || 'NONE', fibScore: c.fibScore || 0,
+    fib: c.fib || null,
     reasons: c.reasons, techScore: c.techScore, microScore: c.microScore, leadLag: c.leadLag
   };
   state.cash -= allocation;
   state.stats[c.side.toLowerCase()]++;
-  logEvent("ENTRY", c.symbol, { side: c.side, price: entry, score: c.score, tech: c.techScore, micro: c.microScore, leadLag: c.leadLag, reasons: c.reasons });
+  logEvent("ENTRY", c.symbol, { side: c.side, price: entry, score: c.score, fibZone: c.fibZone, fibScore: c.fibScore, fib: c.fib, tech: c.techScore, micro: c.microScore, leadLag: c.leadLag, reasons: c.reasons });
   return true;
 }
 
@@ -456,13 +536,14 @@ async function scan() {
       enriched.push(...chunk);
     }
     const enrichedMap = new Map(enriched.map(x => [x.symbol + "|" + (x.side || ""), x]));
-    candidates = candidates.map(c => enrichedMap.get(c.symbol + "|" + c.side) || c);
+    candidates = candidates.map(c => { const e = enrichedMap.get(c.symbol + "|" + c.side) || c; return finalCandidate(e, c.side, liquidityMap.get(c.symbol)); });
     candidates.sort((a, b) => b.score - a.score);
 
     state.candidates = candidates.slice(0, 12).map(x => ({
       symbol: x.symbol, side: x.side, score: +x.score.toFixed(2), regime: x.regime, price: x.price,
       rsi: x.rsi, adx: x.adx, relVol: x.relVol, macdHist: x.macdHist, stoch: x.stoch,
       techScore: +x.techScore.toFixed(2), microScore: +x.microScore.toFixed(2), leadLag: +x.leadLag.toFixed(2),
+      fibScore: +Number(x.fibScore||0).toFixed(2), fibZone: x.fibZone || "NONE",
       oiDeltaPct: Number.isFinite(x.oiDeltaPct) ? +x.oiDeltaPct.toFixed(3) : null,
       funding: Number.isFinite(x.funding) ? +x.funding.toFixed(5) : null,
       basisPct: Number.isFinite(x.basisPct) ? +x.basisPct.toFixed(3) : null,
@@ -496,58 +577,17 @@ async function scan() {
   }
 }
 
-app.get("/health", (_q, res) => res.json({ ok: true, status: state.status, version: state.version, scanRunning: state.scanRunning, maxPositions: CFG.maxPositions }));
-
-function closePosition(symbolInput, res) {
-  const symbol = String(symbolInput || "").trim().toUpperCase();
-  const p = state.positions[symbol];
-  if (!p) return res.status(404).json({ ok: false, error: "POSITION_NOT_FOUND", symbol });
-  const price = Number(p.markPrice || p.entry);
-  const raw = p.side === "LONG" ? (price - p.entry) * p.qty : (p.entry - price) * p.qty;
-  const fees = p.allocation * CFG.feeRate + Math.max(0, p.allocation + raw) * CFG.feeRate;
-  const pnl = raw - fees;
-  state.cash += p.allocation + pnl;
-  state.realizedPnl += pnl;
-  if (pnl >= 0) state.stats.wins++; else state.stats.losses++;
-  delete state.positions[symbol];
-  state.cooldown[symbol] = Date.now() + CFG.cooldownMs;
-  logEvent("MANUAL_EXIT", symbol, { side: p.side, entry: p.entry, exit: price, pnl, fees });
-  res.json({ ok: true, symbol, side: p.side, price, pnl });
-}
-
-app.post("/api/close/:symbol", (req, res) => closePosition(req.params.symbol, res));
-app.post("/api/close", (req, res) => closePosition(req.body?.symbol || req.query?.symbol, res));
-
-app.post("/api/close-all", (_q, res) => {
-  let closed = 0, pnl = 0;
-  for (const p of Object.values({ ...state.positions })) {
-    const price = Number(p.markPrice || p.entry);
-    const raw = p.side === "LONG" ? (price - p.entry) * p.qty : (p.entry - price) * p.qty;
-    const fees = p.allocation * CFG.feeRate + Math.max(0, p.allocation + raw) * CFG.feeRate;
-    const net = raw - fees;
-    state.cash += p.allocation + net;
-    state.realizedPnl += net;
-    if (net >= 0) state.stats.wins++; else state.stats.losses++;
-    state.cooldown[p.symbol] = Date.now() + CFG.cooldownMs;
-    pnl += net; closed++;
-    logEvent("MANUAL_CLOSE_ALL", p.symbol, { side: p.side, entry: p.entry, exit: price, pnl: net, fees });
-    delete state.positions[p.symbol];
-  }
-  res.json({ ok: true, closed, pnl });
-});
-
+app.get("/health", (_q, res) => res.json({ ok: true, status: state.status, version: state.version, scanRunning: state.scanRunning }));
 app.get("/status", (_q, res) => res.json(state));
 
 app.get("/", (_q, res) => {
-  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
   res.send(`<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TIERRA · REAL-TIME MARKET INTELLIGENCE</title><style>
 body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;background:#080d13;color:#edf2f7;margin:0;padding:18px}h1{font-size:30px}.card{background:#111a24;border:1px solid #2a3b4e;border-radius:16px;padding:18px;margin:12px 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:12px}.big{font-size:27px;font-weight:800}.ok{color:#4ade80}.bad{color:#fb7185}.warn{color:#fbbf24}.muted{color:#94a3b8}.candidate{padding:12px 0;border-top:1px solid #253443;line-height:1.55}.tag{display:inline-block;padding:3px 7px;border-radius:8px;background:#1b2a39;margin:2px;font-size:12px}.position{margin:12px 0;padding:14px;border-radius:14px;border:1px solid #334155;background:#0d151e}.position.win{border-color:#16a34a;background:linear-gradient(90deg,rgba(22,163,74,.18),#0d151e)}.position.loss{border-color:#dc2626;background:linear-gradient(90deg,rgba(220,38,38,.18),#0d151e)}.position.flat{border-color:#64748b}.poshead{display:flex;justify-content:space-between;gap:10px;align-items:center;font-size:17px}.statepill{padding:5px 9px;border-radius:999px;font-weight:800;font-size:12px}.win .statepill{color:#4ade80;background:rgba(74,222,128,.12)}.loss .statepill{color:#fb7185;background:rgba(251,113,133,.12)}.flat .statepill{color:#cbd5e1;background:rgba(148,163,184,.12)}.posgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:12px 0}.posgrid>div{background:#111c27;border-radius:10px;padding:9px;font-size:12px;color:#94a3b8}.posgrid b{display:block;color:#f8fafc;font-size:14px;margin-top:3px}.win .posgrid div:nth-child(3),.win .posgrid div:nth-child(4){color:#4ade80}.loss .posgrid div:nth-child(3),.loss .posgrid div:nth-child(4){color:#fb7185}.pbar{height:10px;background:#1e293b;border-radius:999px;overflow:hidden;margin:10px 0}.pbar>div{height:100%;background:#4ade80;border-radius:999px}.loss .pbar>div{background:#fb7185}.flat .pbar>div{background:#94a3b8}@media(max-width:700px){.posgrid{grid-template-columns:repeat(2,1fr)}}</style></head><body>
 <h1>🌎 TIERRA · REAL-TIME MARKET INTELLIGENCE</h1><div class="card"><b>🟡 PAPER · Binance USD-M público · TODO EL MERCADO</b><br>Escanea todos los perpetuos USDT. BTC/ETH son contexto; las monedas pequeñas también pueden ser seleccionadas.<br><b>Lead/Lag + Spot/Futures + OI + Funding + Taker Flow + Order Book + Técnica</b><br><span class="muted">No ejecuta dinero real y no garantiza beneficios.</span></div><div id="app">Cargando…</div><script>
 function esc(v){return String(v).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}
-async function closeOne(symbol,btn){symbol=String(symbol||'').trim().toUpperCase();if(!symbol)return;if(!confirm('¿Cerrar '+symbol+'?'))return;try{if(btn){btn.disabled=true;btn.textContent='CERRANDO...';}const r=await fetch('/api/close?symbol='+encodeURIComponent(symbol),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol}),cache:'no-store'});const j=await r.json().catch(()=>({ok:false,error:'RESPUESTA_INVALIDA'}));if(!r.ok||!j.ok){if(btn){btn.disabled=false;btn.textContent='CERRAR '+symbol;}alert(j.error||('Error HTTP '+r.status));return;}await load();}catch(e){if(btn){btn.disabled=false;btn.textContent='CERRAR '+symbol;}alert('Error al cerrar '+symbol+': '+e.message)}}
 async function load(){try{const s=await (await fetch('/status',{cache:'no-store'})).json();let h='<div class="grid">';h+='<div class="card"><div class="muted">ESTADO</div><div class="big">'+esc(s.status)+'</div><div>Scan '+s.scans+' · mercados '+s.dataMarkets+'/'+s.markets+' · '+s.scanMs+' ms</div></div>';h+='<div class="card"><div class="muted">EQUITY</div><div class="big">$'+Number(s.equity).toFixed(2)+'</div><div>Realizado $'+Number(s.realizedPnl).toFixed(2)+' · flotante $'+Number(s.floatingPnl).toFixed(2)+'</div></div>';h+='<div class="card"><div class="muted">BTC CONTEXTO</div><div>'+['1m','5m','15m','1h'].map(tf=>'<span class="tag">'+tf+': '+esc(s.marketContext?.[tf]||'—')+'</span>').join('')+'</div></div></div>';
-h+='<div class="card"><h2>Oportunidades detectadas en todo el mercado</h2>';if(!s.candidates.length)h+='<p class="warn">NO TRADE · no hay convergencia suficiente</p>';s.candidates.forEach(c=>{h+='<div class="candidate"><b>'+esc(c.symbol)+'</b> · <b>'+esc(c.side)+'</b> · EDGE <b>'+c.score+'</b> · '+esc(c.regime)+'<br>Tech '+c.techScore+' · Micro '+c.microScore+' · Lead/Lag '+c.leadLag+' · RSI '+Number(c.rsi).toFixed(1)+' · ADX '+Number(c.adx||0).toFixed(1)+' · RV '+Number(c.relVol||0).toFixed(2)+'x<br>OI Δ '+(c.oiDeltaPct==null?'—':c.oiDeltaPct+'%')+' · Funding '+(c.funding==null?'—':c.funding)+' · Basis '+(c.basisPct==null?'—':c.basisPct+'%')+' · Book '+(c.bookImbalance==null?'—':c.bookImbalance)+' · Taker '+(c.takerRatio==null?'—':c.takerRatio)+' · Spread '+(c.spreadBps==null?'—':c.spreadBps+' bps')+'<br><span class="muted">'+esc((c.reasons||[]).join(' · '))+'</span></div>'});h+='</div>';
-h+='<div class="card"><h2>Posiciones '+Object.keys(s.positions).length+'/10</h2>';const ps=Object.values(s.positions);if(!ps.length)h+='<p class="muted">Sin posiciones.</p>';ps.forEach(p=>{const gross=(p.side==='LONG'?(Number(p.markPrice||p.entry)-p.entry)*p.qty:(p.entry-Number(p.markPrice||p.entry))*p.qty);const estFees=p.allocation*0.0004;const net=gross-estFees;const pct=p.allocation?net/p.allocation*100:0;const cls=net>0.02?'win':net<-0.02?'loss':'flat';const label=net>0.02?'▲ GANANDO':net<-0.02?'▼ PERDIENDO':'● NEUTRAL';const width=Math.min(100,Math.max(0,50+pct*8));h+='<div class="position '+cls+'"><div class="poshead"><div><b>'+esc(p.symbol)+'</b> · <b>'+esc(p.side)+'</b></div><div class="statepill">'+label+'</div></div><div class="posgrid"><div>Entrada<br><b>'+Number(p.entry).toFixed(8)+'</b></div><div>Actual<br><b>'+Number(p.markPrice||p.entry).toFixed(8)+'</b></div><div>P&L neto<br><b>'+((net>=0?'+':'')+net.toFixed(2))+' USDT</b></div><div>Variación<br><b>'+((pct>=0?'+':'')+pct.toFixed(2))+'%</b></div></div><div class="pbar"><div style="width:'+width.toFixed(1)+'%"></div></div><div class="muted">SL '+Number(p.stop).toFixed(8)+' · TP '+Number(p.tp).toFixed(8)+' · '+esc((p.reasons||[]).join(' · '))+'</div><button type="button" onclick="closeOne(this.dataset.symbol,this)" data-symbol="'+esc(p.symbol)+'" style="margin-top:10px;background:#dc2626;color:white;border:0;border-radius:10px;padding:10px 14px;font-weight:800;cursor:pointer">CERRAR '+esc(p.symbol)+'</button></div>'});h+='</div>';
+h+='<div class="card"><h2>Oportunidades detectadas en todo el mercado</h2>';if(!s.candidates.length)h+='<p class="warn">NO TRADE · no hay convergencia suficiente</p>';s.candidates.forEach(c=>{h+='<div class="candidate"><b>'+esc(c.symbol)+'</b> · <b>'+esc(c.side)+'</b> · EDGE <b>'+c.score+'</b> · '+esc(c.regime)+'<br>Tech '+c.techScore+' · Micro '+c.microScore+' · Lead/Lag '+c.leadLag+' · Fib '+Number(c.fibScore||0).toFixed(2)+' '+esc(c.fibZone||'NONE')+' · RSI '+Number(c.rsi).toFixed(1)+' · ADX '+Number(c.adx||0).toFixed(1)+' · RV '+Number(c.relVol||0).toFixed(2)+'x<br>OI Δ '+(c.oiDeltaPct==null?'—':c.oiDeltaPct+'%')+' · Funding '+(c.funding==null?'—':c.funding)+' · Basis '+(c.basisPct==null?'—':c.basisPct+'%')+' · Book '+(c.bookImbalance==null?'—':c.bookImbalance)+' · Taker '+(c.takerRatio==null?'—':c.takerRatio)+' · Spread '+(c.spreadBps==null?'—':c.spreadBps+' bps')+'<br><span class="muted">'+esc((c.reasons||[]).join(' · '))+'</span></div>'});h+='</div>';
+h+='<div class="card"><h2>Posiciones '+Object.keys(s.positions).length+'/4</h2>';const ps=Object.values(s.positions);if(!ps.length)h+='<p class="muted">Sin posiciones.</p>';ps.forEach(p=>{const gross=(p.side==='LONG'?(Number(p.markPrice||p.entry)-p.entry)*p.qty:(p.entry-Number(p.markPrice||p.entry))*p.qty);const estFees=p.allocation*0.0004;const net=gross-estFees;const pct=p.allocation?net/p.allocation*100:0;const cls=net>0.02?'win':net<-0.02?'loss':'flat';const label=net>0.02?'▲ GANANDO':net<-0.02?'▼ PERDIENDO':'● NEUTRAL';const width=Math.min(100,Math.max(0,50+pct*8));h+='<div class="position '+cls+'"><div class="poshead"><div><b>'+esc(p.symbol)+'</b> · <b>'+esc(p.side)+'</b></div><div class="statepill">'+label+'</div></div><div class="posgrid"><div>Entrada<br><b>'+Number(p.entry).toFixed(8)+'</b></div><div>Actual<br><b>'+Number(p.markPrice||p.entry).toFixed(8)+'</b></div><div>P&L neto<br><b>'+((net>=0?'+':'')+net.toFixed(2))+' USDT</b></div><div>Variación<br><b>'+((pct>=0?'+':'')+pct.toFixed(2))+'%</b></div></div><div class="pbar"><div style="width:'+width.toFixed(1)+'%"></div></div><div class="muted">SL '+Number(p.stop).toFixed(8)+' · TP '+Number(p.tp).toFixed(8)+' · '+esc((p.reasons||[]).join(' · '))+'</div></div>'});h+='</div>';
 h+='<div class="card"><b>Resultados:</b> '+s.stats.wins+' ganadoras · '+s.stats.losses+' perdedoras · LONG '+s.stats.long+' · SHORT '+s.stats.short+'<br><span class="muted">Último scan: '+esc(s.lastScan||'')+'</span></div>';document.getElementById('app').innerHTML=h}catch(e){document.getElementById('app').innerHTML='<div class="card bad">'+esc(e.message)+'</div>'}}load();setInterval(load,5000);</script></body></html>`);
 });
 
