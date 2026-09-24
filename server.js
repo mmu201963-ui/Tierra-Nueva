@@ -436,7 +436,8 @@ function fillGate(c){
   const maxSpread=Number(process.env.MAX_SPREAD_BPS||12);
   const passed=spread<=maxSpread;
   state.mesh.FILLS.last={symbol:c.symbol,spreadBps:+spread.toFixed(2),passed};
-  if(!passed) state.mesh.VET.failed++;
+  if(!passed) state.mesh.FILLS.failed=(state.mesh.FILLS.failed||0)+1;
+  else state.mesh.FILLS.passed=(state.mesh.FILLS.passed||0)+1;
   return {passed,reasons:passed?[]:[`SPREAD_${spread.toFixed(1)}BPS`]};
 }
 
@@ -472,6 +473,7 @@ async function scan(){
   state.scanning=true;
   const started=Date.now();
   try{
+    meshReset();
     const universe=await loadUniverse();
     state.symbols=universe.slice(0,CFG.ANALYZE_TOP).map(x=>x.symbol);
     state.btc=await getBtc().catch(()=>null);
@@ -515,10 +517,10 @@ async function scan(){
       flow:+(x.micro?.flow||0).toFixed(3),details:x.details
     }));
 
-    state.rejections=state.candidates.slice(0,20).map(c=>{
-      const m=meshDecision(c);
-      return {symbol:c.symbol,side:c.side,score:c.score,reason:m.ok?'':m.reason,stage:m.stage};
-    });
+    const decisions=final.slice(0,20).map(c=>({candidate:c,decision:meshDecision(c)}));
+    state.rejections=decisions.map(({candidate:c,decision:m})=>({
+      symbol:c.symbol,side:c.side,score:c.score,reason:m.ok?'':m.reason,stage:m.stage
+    }));
 
     state.lastDecision='SCAN COMPLETE';
     state.lastDecisionDetail=`${universe.length} mercados · ${clean.length} analizados · top ${final[0]?.symbol||'ninguno'}`;
@@ -531,9 +533,8 @@ async function scan(){
       state.lastDecisionDetail='Nuevas entradas pausadas: pérdida acumulada >=1% o 5 pérdidas cerradas.';
     }
     if(state.enabled && !circuitBreaker && Object.keys(state.positions).length<CFG.MAX_POS){
-      for(const c of final){
+      for(const {candidate:c,decision:m} of decisions){
         if(opened>=2)break; // no more than two new paper entries per scan
-        const m=meshDecision(c);
         if(m.ok){
           const ok=openPaper(c,m.plan);
           if(ok)opened++;
@@ -655,7 +656,7 @@ body{margin:0;background:#080d14;color:#e9eef5;font-family:system-ui,Arial}heade
 <body><header><h1>☀ SOL — MULTI-STRATEGY ENGINE</h1><div class="sub">Binance USD-M · TODO EL MERCADO · <b id="mode">PAPER</b> · LIVE desactivado por defecto</div></header>
 <div class="wrap"><div class="row"><button class="btn" onclick="start()">PRENDER</button><button class="btn btn2" onclick="stop()">PAUSAR</button><button class="btn btn2" onclick="scan()">ESCANEAR AHORA</button><button class="btn btn2" onclick="test()">PROBAR BINANCE</button><button class="btn btn2" onclick="closeAll()">CERRAR TODO</button></div>
 <div class="grid" style="margin-top:10px">
-<div class="card"><div class="small">ESTADO</div><div class="v" id="status">—</div></div><div class="card"><div class="small">MERCADOS</div><div class="v" id="markets">0</div></div><div class="card"><div class="small">ANALIZADOS</div><div class="v" id="analyzed">0</div></div><div class="card"><div class="small">SCAN</div><div class="v" id="scanNo">0</div></div><div class="card"><div class="small">EQUITY PAPER</div><div class="v" id="eq">$0</div></div><div class="card"><div class="small">POSICIONES</div><div class="v" id="pos">0/10</div></div><div class="card"><div class="small">BINANCE</div><div class="v" id="bin">—</div></div><div class="card"><div class="small">RESULTADO</div><div class="v" id="res">0 / 0</div></div></div>
+<div class="card"><div class="small">ESTADO</div><div class="v" id="status">—</div></div><div class="card"><div class="small">MERCADOS</div><div class="v" id="markets">0</div></div><div class="card"><div class="small">ANALIZADOS</div><div class="v" id="analyzed">0</div></div><div class="card"><div class="small">SCAN</div><div class="v" id="scanNo">0</div></div><div class="card"><div class="small">EQUITY PAPER</div><div class="v" id="eq">$10,000.00</div></div><div class="card"><div class="small">POSICIONES</div><div class="v" id="pos">0/10</div></div><div class="card"><div class="small">BINANCE</div><div class="v" id="bin">—</div></div><div class="card"><div class="small">RESULTADO</div><div class="v" id="res">0 / 0</div></div></div>
 <div class="card" style="margin-top:10px"><b>DECISIÓN DEL MOTOR</b><div id="decision" style="margin-top:8px">—</div></div>
 <div class="card" style="margin-top:10px"><b>TOP SEÑALES</b><div class="scroll"><table><thead><tr><th>Símbolo</th><th>Lado</th><th>Estrategia</th><th>Score</th><th>RSI</th><th>RVOL</th><th>Book</th><th>Flow</th><th>Estado</th></tr></thead><tbody id="signals"></tbody></table></div></div>
 <div class="card" style="margin-top:10px"><b>⚙️ MESH PIPELINE</b>
