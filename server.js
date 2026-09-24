@@ -13,26 +13,18 @@ const CFG = {
   maxHoldMs: 45 * 60 * 1000,
   pollMs: 15000,
   analysisBatch: 20,
-  microstructureTop: 36,
+  microstructureTop: 24,
   initialCapital: Number(process.env.INITIAL_CAPITAL || 10000),
   feeRate: Number(process.env.PAPER_FEE_RATE || 0.0004),
-  slippageBps: Number(process.env.PAPER_SLIPPAGE_BPS || 3),
-  minProbability: Number(process.env.MIN_SIGNAL_PROBABILITY || 0.56),
-  maxAtrPct: Number(process.env.MAX_ATR_PCT || 0.025),
-  kellyFraction: Number(process.env.KELLY_FRACTION || 0.25),
-  minAllocationPct: Number(process.env.MIN_ALLOCATION_PCT || 0.005),
-  maxAllocationPct: Number(process.env.MAX_ALLOCATION_PCT || 0.03),
-  fibWeight: Number(process.env.FIB_WEIGHT || 1.4),
-  bayesWeight: Number(process.env.BAYES_WEIGHT || 2.0),
-  timingWeight: Number(process.env.TIMING_WEIGHT || 0.7),
-  divergenceWeight: Number(process.env.DIVERGENCE_WEIGHT || 0.8),
-  fibLookback: Number(process.env.FIB_LOOKBACK || 80)
+  slippageBps: Number(process.env.PAPER_SLIPPAGE_BPS || 3)
 };
 
 const state = {
-  version: "TIERRA-ADAPTIVE-BAYES-KELLY-FIB-v1.5",
+  version: "TIERRA-ADAPTIVE-BAYES-KELLY-FIB-v1.6",
   mode: process.env.LIVE_TRADING === "true" ? "LIVE" : "PAPER",
   status: "STARTING",
+  botEnabled: true,
+  pnlHistory: [],
   markets: 0,
   dataMarkets: 0,
   scans: 0,
@@ -52,10 +44,7 @@ const state = {
   symbolsCache: [],
   liveAvailable: 0,
   lastError: null,
-  execution: { orders: 0, live: process.env.LIVE_TRADING === "true" },
-  bayes: {},
-  timing: {},
-  tradeHistory: []
+  execution: { orders: 0, live: process.env.LIVE_TRADING === "true" }
 };
 
 function logEvent(type, symbol, data) {
@@ -64,6 +53,50 @@ function logEvent(type, symbol, data) {
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function recordPnlSample() {
+  const sample = {
+    t: Date.now(),
+    equity: Number(state.equity || 0),
+    realized: Number(state.realizedPnl || 0),
+    floating: Number(state.floatingPnl || 0),
+    positions: Object.keys(state.positions).length
+  };
+  state.pnlHistory.push(sample);
+  if (state.pnlHistory.length > 180) state.pnlHistory = state.pnlHistory.slice(-180);
+}
+
+async function refreshPaperPnl() {
+  if (LIVE || !Object.keys(state.positions).length) {
+    if (!LIVE) recordPnlSample();
+    return;
+  }
+  const positions = Object.values(state.positions);
+  let floating = 0;
+  for (const p of positions) {
+    try {
+      const t = await binance('/fapi/v1/ticker/price?symbol=' + encodeURIComponent(p.symbol));
+      const price = Number(t.price);
+      if (!Number.isFinite(price)) continue;
+      p.markPrice = price;
+      const raw = p.side === 'LONG' ? (price - p.entry) * p.qty : (p.entry - price) * p.qty;
+      const fees = p.allocation * CFG.feeRate + Math.max(0, p.allocation + raw) * CFG.feeRate;
+      p.livePnl = raw - fees;
+      p.livePnlPct = p.allocation ? p.livePnl / p.allocation * 100 : 0;
+      floating += p.livePnl;
+    } catch (e) {
+      state.lastError = 'P&L ' + p.symbol + ': ' + e.message;
+    }
+  }
+  state.floatingPnl = floating;
+  state.equity = state.cash + Object.values(state.positions).reduce((sum, p) => sum + Number(p.allocation || 0), 0) + floating;
+  recordPnlSample();
+}
+
+async function pnlLoop() {
+  try { await refreshPaperPnl(); } catch (e) { state.lastError = e.message; }
+  setTimeout(pnlLoop, 2000);
+}
 
 async function fetchJson(url, timeout = 10000) {
   const c = new AbortController();
@@ -264,9 +297,9 @@ async function analyzeSymbol(symbol) {
   const closed = ks.slice(0, -1), closes = closed.map(k => +k[4]), price = +closed.at(-1)[4];
   const e20 = ema(closes, 20), e50 = ema(closes, 50), e20Prev = ema(closes.slice(0, -1), 20);
   const a = atr(closed, 14), r = rsi(closes, 14), rv = relativeVolume(closed, 20);
-  const momentum = closes.at(-1) - closes.at(-6), mc = macd(closes), stoch = stochastic(closed, 14), ob = obv(closed), obPrev = obv(closed.slice(0, -5)), ax = adx(closed, 14), bb = bollinger(closes, 20, 2), fib = fibonacciLevels(closed, CFG.fibLookback);
+  const momentum = closes.at(-1) - closes.at(-6), mc = macd(closes), stoch = stochastic(closed, 14), ob = obv(closed), obPrev = obv(closed.slice(0, -5)), ax = adx(closed, 14), bb = bollinger(closes, 20, 2);
   if (![price, e20, e50, e20Prev, a, r, rv, momentum, stoch, ob, ax].every(Number.isFinite) || !mc || !Number.isFinite(mc.line) || !Number.isFinite(mc.signal) || !bb) throw new Error("invalid data");
-  const x = { symbol, price, ema20: e20, ema50: e50, ema20Prev: e20Prev, atr: a, rsi: r, relVol: rv, momentum, macd: mc.line, macdSignal: mc.signal, macdHist: mc.hist, stoch, obv: ob, obvSlope: Number.isFinite(obPrev) ? ob - obPrev : 0, adx: ax, bbMiddle: bb.middle, bbUpper: bb.upper, bbLower: bb.lower, fib };
+  const x = { symbol, price, ema20: e20, ema50: e50, ema20Prev: e20Prev, atr: a, rsi: r, relVol: rv, momentum, macd: mc.line, macdSignal: mc.signal, macdHist: mc.hist, stoch, obv: ob, obvSlope: Number.isFinite(obPrev) ? ob - obPrev : 0, adx: ax, bbMiddle: bb.middle, bbUpper: bb.upper, bbLower: bb.lower };
   x.regime = regime(x); x.longTech = technicalScore(x, "LONG"); x.shortTech = technicalScore(x, "SHORT");
   return x;
 }
@@ -371,141 +404,14 @@ function leadLagScore(x, side) {
   return -0.8; // overextended: do not chase.
 }
 
-
-function fibonacciLevels(klines, lookback = CFG.fibLookback) {
-  const a = klines.slice(-Math.min(lookback, klines.length));
-  if (a.length < 20) return null;
-  let hi = -Infinity, lo = Infinity, hiIndex = -1, loIndex = -1;
-  a.forEach((k, i) => {
-    const h = +k[2], l = +k[3];
-    if (h > hi) { hi = h; hiIndex = i; }
-    if (l < lo) { lo = l; loIndex = i; }
-  });
-  const range = hi - lo;
-  if (!Number.isFinite(range) || range <= 0) return null;
-  return {
-    high: hi, low: lo, range,
-    highIndex: hiIndex, lowIndex: loIndex,
-    bullishSwing: loIndex < hiIndex,
-    r382: hi - range * 0.382,
-    r500: hi - range * 0.500,
-    r618: hi - range * 0.618,
-    r786: hi - range * 0.786,
-    s382: lo + range * 0.382,
-    s500: lo + range * 0.500,
-    s618: lo + range * 0.618,
-    s786: lo + range * 0.786,
-    ext1272Up: hi + range * 0.272,
-    ext1618Up: hi + range * 0.618,
-    ext1272Down: lo - range * 0.272,
-    ext1618Down: lo - range * 0.618
-  };
-}
-
-function fibScore(x, side) {
-  if (!x.fib) return { score: 0, zone: "NONE", target: null, stop: null };
-  const f = x.fib, p = x.price;
-  const near = (level, tolerance = 0.0018) => Math.abs(p - level) / p <= tolerance;
-  if (side === "LONG") {
-    if (!f.bullishSwing) return { score: 0, zone: "NONE", target: f.ext1272Up, stop: f.low };
-    if (near(f.r500, 0.0015) || near(f.r618, 0.0015)) return { score: 2.0, zone: "GOLDEN_50_618", target: f.ext1272Up, stop: f.r786 };
-    if (near(f.r382) || near(f.r786)) return { score: 1.0, zone: near(f.r382) ? "R382" : "R786", target: f.ext1272Up, stop: f.r786 };
-    const inZone = p <= f.r382 && p >= f.r786;
-    return { score: inZone ? 0.7 : 0, zone: inZone ? "RETRACE" : "NONE", target: f.ext1272Up, stop: f.r786 };
-  }
-  if (f.bullishSwing) return { score: 0, zone: "NONE", target: f.ext1272Down, stop: f.high };
-  if (near(f.s500, 0.0015) || near(f.s618, 0.0015)) return { score: 2.0, zone: "GOLDEN_50_618", target: f.ext1272Down, stop: f.s786 };
-  if (near(f.s382) || near(f.s786)) return { score: 1.0, zone: near(f.s382) ? "S382" : "S786", target: f.ext1272Down, stop: f.s786 };
-  const inZone = p >= f.s382 && p <= f.s786;
-  return { score: inZone ? 0.7 : 0, zone: inZone ? "RETRACE" : "NONE", target: f.ext1272Down, stop: f.s786 };
-}
-
-function betaFor(key) {
-  const b = state.bayes[key] || { wins: 0, losses: 0 };
-  // Weak prior: the bot must earn its confidence from observed outcomes.
-  return { alpha: 2 + b.wins, beta: 2 + b.losses, n: b.wins + b.losses };
-}
-
-function bayesianProbability(c) {
-  const key = `${c.side}|${c.regime}|${new Date().getUTCHours()}`;
-  const b = betaFor(key);
-  const posterior = b.alpha / (b.alpha + b.beta);
-  // Convert the composite edge into a bounded prior probability, then shrink it toward the observed posterior.
-  const edgePrior = 1 / (1 + Math.exp(-(c.score - 6.0) / 1.35));
-  const confidence = Math.min(0.75, 0.25 + b.n / 80);
-  return 0.55 * edgePrior + 0.45 * posterior * confidence + 0.45 * 0.5 * (1 - confidence);
-}
-
-function timingProbability(c) {
-  const h = String(new Date().getUTCHours());
-  const t = state.timing[h] || { wins: 0, losses: 0 };
-  const n = t.wins + t.losses;
-  if (n < 8) return 0.5;
-  return (t.wins + 2) / (n + 4);
-}
-
-function recordLearning(p, pnl) {
-  const hour = String(new Date(p.openedAt || Date.now()).getUTCHours());
-  const key = `${p.side}|${p.regime || 'UNKNOWN'}|${hour}`;
-  const b = state.bayes[key] || (state.bayes[key] = { wins: 0, losses: 0 });
-  const t = state.timing[hour] || (state.timing[hour] = { wins: 0, losses: 0 });
-  if (pnl >= 0) { b.wins++; t.wins++; } else { b.losses++; t.losses++; }
-  state.tradeHistory.push({ time: Date.now(), symbol: p.symbol, side: p.side, regime: p.regime, hour, pnl });
-  state.tradeHistory = state.tradeHistory.slice(-500);
-}
-
-function divergenceScore(x, side) {
-  const ctx = state.marketContext || {};
-  const btc = ctx["1m"];
-  if (!btc || btc === "UNKNOWN") return 0;
-  // Divergence is only rewarded when the asset is moving first and BTC has not invalidated the direction.
-  const aligned = (side === "LONG" && x.momentum > 0) || (side === "SHORT" && x.momentum < 0);
-  if (!aligned) return -0.5;
-  if (side === "LONG" && btc === "BEAR") return -0.8;
-  if (side === "SHORT" && btc === "BULL") return -0.8;
-  if (side === "LONG" && btc === "BULL") return 0.5;
-  if (side === "SHORT" && btc === "BEAR") return 0.5;
-  return 0.2;
-}
-
-function volatilityScore(x) {
-  const atrPct = x.price ? x.atr / x.price : 0;
-  if (!Number.isFinite(atrPct)) return -1;
-  if (atrPct > CFG.maxAtrPct) return -2;
-  if (atrPct > CFG.maxAtrPct * 0.8) return -0.6;
-  if (atrPct >= 0.003 && atrPct <= 0.015) return 0.5;
-  return 0;
-}
-
-function kellySizing(c) {
-  const p = Math.max(0.01, Math.min(0.99, c.probability || 0.5));
-  const rewardRisk = Math.max(1.05, Number(c.rewardRisk || 1.9));
-  const q = 1 - p;
-  const rawKelly = Math.max(0, (p * rewardRisk - q) / rewardRisk);
-  const fractional = rawKelly * CFG.kellyFraction;
-  const pct = Math.max(CFG.minAllocationPct, Math.min(CFG.maxAllocationPct, fractional));
-  return { rawKelly, fractionalKelly: fractional, allocationPct: pct };
-}
-
 function finalCandidate(x, side, liquidity) {
   const tech = side === "LONG" ? x.longTech : x.shortTech;
   const micro = microScore(x, side);
   const lead = leadLagScore(x, side);
-  const fib = fibScore(x, side);
-  const divergence = divergenceScore(x, side);
-  const volatility = volatilityScore(x);
   const liq = liquidity && liquidity.quoteVol > 0 ? (liquidity.quoteVol >= 5e6 ? .8 : liquidity.quoteVol >= 1e6 ? .4 : liquidity.quoteVol >= 2e5 ? 0 : -.8) : 0;
   const spreadPenalty = Number.isFinite(x.spreadBps) ? (x.spreadBps > 20 ? -1.2 : x.spreadBps > 10 ? -.5 : .3) : 0;
-  const edge = tech + micro.score + lead + liq + spreadPenalty + fib.score * CFG.fibWeight + divergence * CFG.divergenceWeight + volatility;
-  const provisional = { ...x, side, score: edge, techScore: tech, microScore: micro.score, leadLag: lead, fibScore: fib.score, fibZone: fib.zone, fibTarget: fib.target, fibStop: fib.stop, divergenceScore: divergence, volatilityScore: volatility, reasons: [...micro.reasons, fib.zone !== "NONE" ? `FIB ${fib.zone}` : null, divergence > 0.3 ? "BTC ALIGN/DIVERGENCE" : null].filter(Boolean), quoteVol: liquidity?.quoteVol || 0, change24: liquidity?.change24 || 0 };
-  provisional.rewardRisk = 1.9;
-  provisional.probability = bayesianProbability(provisional);
-  provisional.timingProbability = timingProbability(provisional);
-  provisional.probability = Math.max(0.01, Math.min(0.99, provisional.probability + (provisional.timingProbability - 0.5) * 0.25));
-  provisional.score += (provisional.probability - 0.5) * CFG.bayesWeight;
-  provisional.score += (provisional.timingProbability - 0.5) * CFG.timingWeight;
-  provisional.kelly = kellySizing(provisional);
-  return provisional;
+  const edge = tech + micro.score + lead + liq + spreadPenalty;
+  return { ...x, side, score: edge, techScore: tech, microScore: micro.score, leadLag: lead, reasons: micro.reasons, quoteVol: liquidity?.quoteVol || 0, change24: liquidity?.change24 || 0 };
 }
 
 function bestCandidates(results, liquidityMap) {
@@ -517,10 +423,10 @@ function bestCandidates(results, liquidityMap) {
     const liq = liquidityMap.get(x.symbol);
     for (const side of ["LONG", "SHORT"]) {
       const c = finalCandidate(x, side, liq);
-      if (c.score >= CFG.minEdge && c.probability >= CFG.minProbability && c.volatilityScore > -1.5) arr.push(c);
+      if (c.score >= CFG.minEdge) arr.push(c);
     }
   }
-  arr.sort((a, b) => (b.score - a.score) || (b.probability - a.probability));
+  arr.sort((a, b) => b.score - a.score);
   return arr;
 }
 
@@ -529,22 +435,18 @@ function sideCount(side) { return Object.values(state.positions).filter(p => p.s
 function paperEnter(c) {
   if (Object.keys(state.positions).length >= CFG.maxPositions) return false;
   if (sideCount(c.side) >= CFG.maxSameSide) return false;
-  const sizing = kellySizing(c);
-  const allocation = Math.min(state.cash, state.equity * sizing.allocationPct);
+  const allocation = Math.min(state.cash, state.equity * CFG.positionRiskPct);
   if (allocation <= 0) return false;
   const slip = CFG.slippageBps / 10000;
   const entry = c.side === "LONG" ? c.price * (1 + slip) : c.price * (1 - slip);
-  const fibStop = Number.isFinite(c.fibStop) ? Math.abs(c.price - c.fibStop) : 0;
-  const stopDist = Math.max(c.atr * 1.35, c.price * 0.0055, fibStop * 0.55);
-  const tpDist = Math.max(stopDist * 1.75, Number.isFinite(c.fibTarget) ? Math.abs(c.fibTarget - c.price) : 0);
+  const stopDist = Math.max(c.atr * 1.6, c.price * 0.007);
+  const tpDist = stopDist * 1.9;
   state.positions[c.symbol] = {
     symbol: c.symbol, side: c.side, entry, qty: allocation / entry, allocation,
     stop: c.side === "LONG" ? entry - stopDist : entry + stopDist,
     tp: c.side === "LONG" ? entry + tpDist : entry - tpDist,
     openedAt: Date.now(), score: c.score, regime: c.regime,
-    reasons: c.reasons, techScore: c.techScore, microScore: c.microScore, leadLag: c.leadLag,
-    probability: c.probability, timingProbability: c.timingProbability, kellyPct: sizing.allocationPct,
-    fibZone: c.fibZone, fibTarget: c.fibTarget, fibStop: c.fibStop
+    reasons: c.reasons, techScore: c.techScore, microScore: c.microScore, leadLag: c.leadLag
   };
   state.cash -= allocation;
   state.stats[c.side.toLowerCase()]++;
@@ -572,7 +474,6 @@ function managePosition(p, x) {
   state.cash += p.allocation + pnl;
   state.realizedPnl += pnl;
   if (pnl >= 0) state.stats.wins++; else state.stats.losses++;
-  recordLearning(p, pnl);
   delete state.positions[p.symbol];
   state.cooldown[p.symbol] = Date.now() + CFG.cooldownMs;
   logEvent("EXIT", p.symbol, { side: p.side, reason, entry: p.entry, exit: x.price, pnl, fees });
@@ -686,9 +587,7 @@ async function enterLive(c){
   state.liveAvailable=available;
   state.equity=equity;
   if(!Number.isFinite(equity)||equity<=0) throw new Error('Equity Binance inválida');
-  const sizing=kellySizing(c);
-  const marginPct=Math.min(LIVE_MARGIN_PCT, sizing.allocationPct);
-  const margin=Math.min(equity*marginPct,available*0.25);
+  const margin=Math.min(equity*LIVE_MARGIN_PCT,available*0.25);
   if(margin<=0) throw new Error('Margen disponible insuficiente');
   const rules=await liveSymbolRules(c.symbol);
   const notional=margin*LIVE_LEVERAGE;
@@ -706,7 +605,7 @@ async function enterLive(c){
   const rawTp=c.side==='LONG'?entry+tpDist:entry-tpDist;
   const stop=roundPrice(rawStop,rules.tick);
   const tp=roundPrice(rawTp,rules.tick);
-  const p={symbol:c.symbol,side:c.side,entry,markPrice:entry,qty:qtyN,allocation:margin,margin,stop,tp,openedAt:Date.now(),score:c.score,regime:c.regime,reasons:c.reasons||[],techScore:c.techScore,microScore:c.microScore,leadLag:c.leadLag,probability:c.probability,timingProbability:c.timingProbability,kellyPct:marginPct, fibZone:c.fibZone,fibTarget:c.fibTarget,fibStop:c.fibStop,orderId:resp.orderId,live:true};
+  const p={symbol:c.symbol,side:c.side,entry,markPrice:entry,qty:qtyN,allocation:margin,margin,stop,tp,openedAt:Date.now(),score:c.score,regime:c.regime,reasons:c.reasons||[],techScore:c.techScore,microScore:c.microScore,leadLag:c.leadLag,orderId:resp.orderId,live:true};
   state.positions[c.symbol]=p;
   state.execution.orders++;
   state.stats[c.side.toLowerCase()]++;
@@ -730,7 +629,6 @@ async function closeLivePosition(p,reason='MANUAL',price=null){
   delete state.positions[p.symbol];
   state.realizedPnl+=pnl;
   if(pnl>=0) state.stats.wins++; else state.stats.losses++;
-  recordLearning(p, pnl);
   state.cooldown[p.symbol]=Date.now()+CFG.cooldownMs;
   logEvent('LIVE_EXIT',p.symbol,{side:p.side,reason,entry:p.entry,exit,pnl,fees});
   return true;
@@ -821,17 +719,13 @@ async function scan() {
       enriched.push(...chunk);
     }
     const enrichedMap = new Map(enriched.map(x => [x.symbol + "|" + (x.side || ""), x]));
-    // Recalculate the COMPLETE score after OI/funding/order-book/taker data arrive.
-    candidates = candidates.map(c => {
-      const e = enrichedMap.get(c.symbol + "|" + c.side) || c;
-      return finalCandidate(e, c.side, liquidityMap.get(c.symbol));
-    }).filter(c => c.score >= CFG.minEdge && c.probability >= CFG.minProbability && c.volatilityScore > -1.5);
-    candidates.sort((a, b) => (b.score - a.score) || (b.probability - a.probability));
+    candidates = candidates.map(c => enrichedMap.get(c.symbol + "|" + c.side) || c);
+    candidates.sort((a, b) => b.score - a.score);
 
     state.candidates = candidates.slice(0, 12).map(x => ({
       symbol: x.symbol, side: x.side, score: +x.score.toFixed(2), regime: x.regime, price: x.price,
       rsi: x.rsi, adx: x.adx, relVol: x.relVol, macdHist: x.macdHist, stoch: x.stoch,
-      techScore: +x.techScore.toFixed(2), microScore: +x.microScore.toFixed(2), leadLag: +x.leadLag.toFixed(2), fibScore: +x.fibScore.toFixed(2), fibZone: x.fibZone, probability: +(x.probability*100).toFixed(1), timingProbability: +(x.timingProbability*100).toFixed(1), kellyPct: +(x.kelly?.allocationPct*100).toFixed(2),
+      techScore: +x.techScore.toFixed(2), microScore: +x.microScore.toFixed(2), leadLag: +x.leadLag.toFixed(2),
       oiDeltaPct: Number.isFinite(x.oiDeltaPct) ? +x.oiDeltaPct.toFixed(3) : null,
       funding: Number.isFinite(x.funding) ? +x.funding.toFixed(5) : null,
       basisPct: Number.isFinite(x.basisPct) ? +x.basisPct.toFixed(3) : null,
@@ -869,9 +763,11 @@ async function scan() {
       }
       await syncLivePositions();
     } else {
-      const chosen = candidates.find(c => c.score >= CFG.minEdge && sideCount(c.side) < CFG.maxSameSide);
-      if (chosen && Object.keys(state.positions).length < CFG.maxPositions) paperEnter(chosen);
-      state.status = "PAPER_RUNNING";
+      if (state.botEnabled) {
+        const chosen = candidates.find(c => c.score >= CFG.minEdge && sideCount(c.side) < CFG.maxSameSide);
+        if (chosen && Object.keys(state.positions).length < CFG.maxPositions) paperEnter(chosen);
+      }
+      state.status = state.botEnabled ? "PAPER_RUNNING" : "PAPER_PAUSED";
     }
 
     if (!LIVE) {
@@ -888,7 +784,7 @@ async function scan() {
     state.scans++;
     state.lastScan = new Date().toISOString();
     state.scanMs = Date.now() - started;
-    if (!LIVE || state.status !== "LIVE_RISK_PAUSED") state.status = LIVE ? "LIVE_RUNNING" : "PAPER_RUNNING";
+    if (!LIVE) state.status = state.botEnabled ? "PAPER_RUNNING" : "PAPER_PAUSED";
   } finally {
     state.scanRunning = false;
   }
@@ -900,8 +796,19 @@ app.get("/api/status", (_q, res) => res.json(state));
 app.get("/api/health", (_q, res) => res.json({ ok:true, status:state.status, version:state.version, mode:state.mode, live:LIVE, scanRunning:state.scanRunning, lastError:state.lastError }));
 app.get("/api/positions", (_q, res) => res.json(Object.values(state.positions)));
 
-app.post("/api/start", (_q,res)=>{ state.status=LIVE?"LIVE_RUNNING":"PAPER_RUNNING"; res.json({ok:true,mode:state.mode,status:state.status}); });
-app.post("/api/stop", (_q,res)=>{ state.status=LIVE?"LIVE_PAUSED":"PAPER_PAUSED"; res.json({ok:true,status:state.status}); });
+app.post("/api/start", (_q,res)=>{
+  state.botEnabled = true;
+  state.status = LIVE ? "LIVE_RUNNING" : "PAPER_RUNNING";
+  logEvent("BOT_START", null, { mode: state.mode });
+  res.json({ok:true,mode:state.mode,status:state.status,botEnabled:true});
+});
+app.post("/api/stop", (_q,res)=>{
+  state.botEnabled = false;
+  state.status = LIVE ? "LIVE_PAUSED" : "PAPER_PAUSED";
+  logEvent("BOT_PAUSE", null, { mode: state.mode });
+  res.json({ok:true,status:state.status,botEnabled:false});
+});
+app.get("/api/pnl", (_q,res)=>res.json({ok:true,equity:state.equity,realizedPnl:state.realizedPnl,floatingPnl:state.floatingPnl,history:state.pnlHistory}));
 app.post("/api/close/:symbol", async (req,res)=>{
   try{
     const symbol=String(req.params.symbol||'').toUpperCase();
@@ -925,21 +832,51 @@ app.get("/api/binance-check",async(_q,res)=>{
   catch(e){state.lastError=e.message;res.status(502).json({ok:false,error:e.message,live:LIVE});}
 });
 
-
-app.get("/api/learning", (_q,res)=>res.json({bayes:state.bayes,timing:state.timing,history:state.tradeHistory.slice(-100)}));
 app.get("/", (_q, res) => {
   res.send(`<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TIERRA · REAL-TIME MARKET INTELLIGENCE</title><style>
-body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;background:#080d13;color:#edf2f7;margin:0;padding:18px}h1{font-size:30px}.card{background:#111a24;border:1px solid #2a3b4e;border-radius:16px;padding:18px;margin:12px 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:12px}.big{font-size:27px;font-weight:800}.ok{color:#4ade80}.bad{color:#fb7185}.warn{color:#fbbf24}.muted{color:#94a3b8}.candidate{padding:12px 0;border-top:1px solid #253443;line-height:1.55}.tag{display:inline-block;padding:3px 7px;border-radius:8px;background:#1b2a39;margin:2px;font-size:12px}.position{margin:12px 0;padding:14px;border-radius:14px;border:1px solid #334155;background:#0d151e}.position.win{border-color:#16a34a;background:linear-gradient(90deg,rgba(22,163,74,.18),#0d151e)}.position.loss{border-color:#dc2626;background:linear-gradient(90deg,rgba(220,38,38,.18),#0d151e)}.position.flat{border-color:#64748b}.poshead{display:flex;justify-content:space-between;gap:10px;align-items:center;font-size:17px}.statepill{padding:5px 9px;border-radius:999px;font-weight:800;font-size:12px}.win .statepill{color:#4ade80;background:rgba(74,222,128,.12)}.loss .statepill{color:#fb7185;background:rgba(251,113,133,.12)}.flat .statepill{color:#cbd5e1;background:rgba(148,163,184,.12)}.posgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:12px 0}.posgrid>div{background:#111c27;border-radius:10px;padding:9px;font-size:12px;color:#94a3b8}.posgrid b{display:block;color:#f8fafc;font-size:14px;margin-top:3px}.win .posgrid div:nth-child(3),.win .posgrid div:nth-child(4){color:#4ade80}.loss .posgrid div:nth-child(3),.loss .posgrid div:nth-child(4){color:#fb7185}.pbar{height:10px;background:#1e293b;border-radius:999px;overflow:hidden;margin:10px 0}.pbar>div{height:100%;background:#4ade80;border-radius:999px}.loss .pbar>div{background:#fb7185}.flat .pbar>div{background:#94a3b8}@media(max-width:700px){.posgrid{grid-template-columns:repeat(2,1fr)}}</style></head><body>
-<h1>🌎 TIERRA · REAL-TIME MARKET INTELLIGENCE</h1><div class="card"><b>Versión: TIERRA-ADAPTIVE-BAYES-KELLY-FIB-v1.5</b> · Backend + Dashboard sincronizados</div><div class="card"><b>⚙️ TIERRA · Binance USD-M · TODO EL MERCADO · <span id="modeBadge">${state.mode}</span></b><br>Escanea todos los perpetuos USDT. BTC/ETH son contexto; las monedas pequeñas también pueden ser seleccionadas.<br><b>Lead/Lag + Bayes + Kelly fraccional + Fibonacci + Volatilidad + OI + Funding + Taker Flow + Order Book + Técnica</b><br><span class="muted">LIVE solo si LIVE_TRADING=true. No garantiza beneficios.</span></div><div class="card"><button onclick="post('/api/start')">INICIAR</button><button onclick="post('/api/stop')">PAUSAR</button><button onclick="check()">PROBAR BINANCE</button><button onclick="closeAll()">CERRAR TODO</button></div><div id="app">Cargando…</div><script>
+body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;background:#080d13;color:#edf2f7;margin:0;padding:18px}h1{font-size:30px}.card{background:#111a24;border:1px solid #2a3b4e;border-radius:16px;padding:18px;margin:12px 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:12px}.big{font-size:27px;font-weight:800}.ok{color:#4ade80}.bad{color:#fb7185}.warn{color:#fbbf24}.muted{color:#94a3b8}.candidate{padding:12px 0;border-top:1px solid #253443;line-height:1.55}.tag{display:inline-block;padding:3px 7px;border-radius:8px;background:#1b2a39;margin:2px;font-size:12px}.position{margin:12px 0;padding:14px;border-radius:14px;border:1px solid #334155;background:#0d151e}.position.win{border-color:#16a34a;background:linear-gradient(90deg,rgba(22,163,74,.18),#0d151e)}.position.loss{border-color:#dc2626;background:linear-gradient(90deg,rgba(220,38,38,.18),#0d151e)}.position.flat{border-color:#64748b}.poshead{display:flex;justify-content:space-between;gap:10px;align-items:center;font-size:17px}.statepill{padding:5px 9px;border-radius:999px;font-weight:800;font-size:12px}.win .statepill{color:#4ade80;background:rgba(74,222,128,.12)}.loss .statepill{color:#fb7185;background:rgba(251,113,133,.12)}.flat .statepill{color:#cbd5e1;background:rgba(148,163,184,.12)}.posgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:12px 0}.posgrid>div{background:#111c27;border-radius:10px;padding:9px;font-size:12px;color:#94a3b8}.posgrid b{display:block;color:#f8fafc;font-size:14px;margin-top:3px}.win .posgrid div:nth-child(3),.win .posgrid div:nth-child(4){color:#4ade80}.loss .posgrid div:nth-child(3),.loss .posgrid div:nth-child(4){color:#fb7185}.pbar{height:10px;background:#1e293b;border-radius:999px;overflow:hidden;margin:10px 0}.pbar>div{height:100%;background:#4ade80;border-radius:999px}.loss .pbar>div{background:#fb7185}.flat .pbar>div{background:#94a3b8}.closebtn{margin-top:10px;background:#7f1d1d;color:#fff;border:1px solid #ef4444;border-radius:10px;padding:11px 14px;font-weight:800;width:100%}.on{background:#14532d!important;color:#fff!important}.off{background:#7f1d1d!important;color:#fff!important}@media(max-width:700px){.posgrid{grid-template-columns:repeat(2,1fr)}}</style></head><body>
+<h1>🌎 TIERRA · REAL-TIME MARKET INTELLIGENCE</h1><div class="card"><b>Versión: TIERRA-ADAPTIVE-BAYES-KELLY-FIB-v1.6</b> · Backend + Dashboard sincronizados</div><div class="card"><b>⚙️ TIERRA · Binance USD-M · TODO EL MERCADO · <span id="modeBadge">${state.mode}</span></b><br>Escanea todos los perpetuos USDT. BTC/ETH son contexto; las monedas pequeñas también pueden ser seleccionadas.<br><b>Lead/Lag + Spot/Futures + OI + Funding + Taker Flow + Order Book + Técnica</b><br><span class="muted">LIVE solo si LIVE_TRADING=true. No garantiza beneficios.</span></div><div class="card"><button id="botBtn" onclick="toggleBot()">PRENDER BOT</button><button onclick="check()">PROBAR BINANCE</button><button onclick="closeAll()">CERRAR TODO</button></div><div id="app">Cargando…</div><script>
 async function post(u){await fetch(u,{method:"POST"});await load()}
 async function check(){alert(JSON.stringify(await (await fetch("/api/binance-check")).json(),null,2))}
 async function closeAll(){if(confirm("¿Cerrar todas las posiciones?")){await fetch("/api/close-all",{method:"POST"});await load()}}
 async function closeOne(sym){const symbol=decodeURIComponent(sym);if(confirm("¿Cerrar "+symbol+"?")){await fetch("/api/close/"+encodeURIComponent(symbol),{method:"POST"});await load()}}
 function esc(v){return String(v).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}
-async function load(){try{const r=await fetch('/status?ts='+Date.now(),{cache:'no-store'});if(!r.ok)throw new Error('/status HTTP '+r.status);const s=await r.json();let h='<div class="grid">';h+='<div class="card"><div class="muted">ESTADO</div><div class="big">'+esc(s.status)+'</div><div>Scan '+s.scans+' · mercados '+s.dataMarkets+'/'+s.markets+' · '+s.scanMs+' ms</div></div>';h+='<div class="card"><div class="muted">EQUITY</div><div class="big">$'+Number(s.equity).toFixed(2)+'</div><div>Realizado $'+Number(s.realizedPnl).toFixed(2)+' · flotante $'+Number(s.floatingPnl).toFixed(2)+'</div></div>';h+='<div class="card"><div class="muted">BTC CONTEXTO</div><div>'+['1m','5m','15m','1h'].map(tf=>'<span class="tag">'+tf+': '+esc(s.marketContext?.[tf]||'—')+'</span>').join('')+'</div></div></div>';
-h+='<div class="card"><h2>Oportunidades detectadas en todo el mercado</h2>';if(!s.candidates.length)h+='<p class="warn">NO TRADE · no hay convergencia suficiente</p>';s.candidates.forEach(c=>{h+='<div class="candidate"><b>'+esc(c.symbol)+'</b> · <b>'+esc(c.side)+'</b> · EDGE <b>'+c.score+'</b> · '+esc(c.regime)+'<br>Tech '+c.techScore+' · Micro '+c.microScore+' · Lead/Lag '+c.leadLag+' · Fib '+c.fibScore+' ('+esc(c.fibZone||'NONE')+') · Timing '+c.timingProbability+'% · RSI '+Number(c.rsi).toFixed(1)+' · ADX '+Number(c.adx||0).toFixed(1)+' · RV '+Number(c.relVol||0).toFixed(2)+'x<br>OI Δ '+(c.oiDeltaPct==null?'—':c.oiDeltaPct+'%')+' · Funding '+(c.funding==null?'—':c.funding)+' · Basis '+(c.basisPct==null?'—':c.basisPct+'%')+' · Book '+(c.bookImbalance==null?'—':c.bookImbalance)+' · Taker '+(c.takerRatio==null?'—':c.takerRatio)+' · Spread '+(c.spreadBps==null?'—':c.spreadBps+' bps')+'<br><span class="muted">'+esc((c.reasons||[]).join(' · '))+'</span></div>'});h+='</div>';
-h+='<div class="card"><h2>Posiciones '+Object.keys(s.positions).length+'/10</h2>';const ps=Object.values(s.positions);if(!ps.length)h+='<p class="muted">Sin posiciones.</p>';ps.forEach(p=>{const gross=(p.side==='LONG'?(Number(p.markPrice||p.entry)-p.entry)*p.qty:(p.entry-Number(p.markPrice||p.entry))*p.qty);const estFees=p.allocation*0.0004;const net=gross-estFees;const pct=p.allocation?net/p.allocation*100:0;const cls=net>0.02?'win':net<-0.02?'loss':'flat';const label=net>0.02?'▲ GANANDO':net<-0.02?'▼ PERDIENDO':'● NEUTRAL';const width=Math.min(100,Math.max(0,50+pct*8));h+='<div class="position '+cls+'"><div class="poshead"><div><b>'+esc(p.symbol)+'</b> · <b>'+esc(p.side)+'</b></div><div class="statepill">'+label+'</div></div><div class="posgrid"><div>Entrada<br><b>'+Number(p.entry).toFixed(8)+'</b></div><div>Actual<br><b>'+Number(p.markPrice||p.entry).toFixed(8)+'</b></div><div>P&L neto<br><b>'+((net>=0?'+':'')+net.toFixed(2))+' USDT</b></div><div>Variación<br><b>'+((pct>=0?'+':'')+pct.toFixed(2))+'%</b></div></div><div class="pbar"><div style="width:'+width.toFixed(1)+'%"></div></div><div class="muted">SL '+Number(p.stop).toFixed(8)+' · TP '+Number(p.tp).toFixed(8)+' · '+esc((p.reasons||[]).join(' · '))+'</div><button style="margin-top:10px;background:#7f1d1d;color:#fff;border:1px solid #ef4444;border-radius:10px;padding:10px 14px;font-weight:800;width:100%" onclick="closeOne(encodeURIComponent(''+p.symbol+''))">CERRAR '+esc(p.symbol)+'</button></div>'});h+='</div>';
-h+='<div class="card"><b>Resultados:</b> '+s.stats.wins+' ganadoras · '+s.stats.losses+' perdedoras · LONG '+s.stats.long+' · SHORT '+s.stats.short+'<br><span class="muted">Último scan: '+esc(s.lastScan||'')+'</span></div>';document.getElementById('app').innerHTML=h}catch(e){document.getElementById('app').innerHTML='<div class="card bad">'+esc(e.message)+'</div>'}}load();setInterval(load,5000);</script></body></html>`);
+async function post(u){await fetch(u,{method:"POST"});await load()}
+async function toggleBot(){
+  const r=await fetch(stateCache&&stateCache.botEnabled?'/api/stop':'/api/start',{method:'POST'});
+  const j=await r.json(); stateCache=j; await load();
+}
+async function check(){alert(JSON.stringify(await (await fetch("/api/binance-check")).json(),null,2))}
+async function closeAll(){if(confirm("¿Cerrar TODAS las posiciones?")){await fetch("/api/close-all",{method:"POST"});await load()}}
+async function closeOne(sym){const symbol=decodeURIComponent(sym);if(confirm("¿Cerrar "+symbol+"?")){const r=await fetch("/api/close/"+encodeURIComponent(symbol),{method:"POST"});if(!r.ok)alert((await r.text()).slice(0,300));await load()}}
+function esc(v){return String(v??'').replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}
+let stateCache={botEnabled:true};
+function fmt(n){return Number(n||0).toFixed(2)}
+function spark(points,key){
+  if(!points||points.length<2)return '<div class="muted">Esperando historial P&L…</div>';
+  const vals=points.map(x=>Number(x[key]||0)); const min=Math.min(...vals),max=Math.max(...vals),range=max-min||1; const w=700,h=150;
+  const path=vals.map((v,i)=>{const x=i*(w/(vals.length-1));const y=h-((v-min)/range)*(h-20)-10;return (i?'L':'M')+x.toFixed(1)+' '+y.toFixed(1)}).join(' ');
+  return '<svg viewBox="0 0 '+w+' '+h+'" preserveAspectRatio="none" style="width:100%;height:150px;background:#0b121a;border-radius:12px"><path d="'+path+'" fill="none" stroke="currentColor" stroke-width="3" vector-effect="non-scaling-stroke"/></svg><div class="muted">Mín '+fmt(min)+' · Máx '+fmt(max)+' · Actual '+fmt(vals.at(-1))+'</div>';
+}
+async function load(){
+ try{
+  const r=await fetch('/status?ts='+Date.now(),{cache:'no-store'}); if(!r.ok)throw new Error('/status HTTP '+r.status); const s=await r.json(); stateCache=s;
+  const btn=document.getElementById('botBtn'); if(btn){btn.textContent=s.botEnabled?'PAUSAR BOT':'PRENDER BOT';btn.className=s.botEnabled?'on':'off'}
+  let h='<div class="grid">';
+  h+='<div class="card"><div class="muted">ESTADO BOT</div><div class="big">'+esc(s.status)+'</div><div>Scan '+s.scans+' · mercados '+s.dataMarkets+'/'+s.markets+' · '+s.scanMs+' ms</div></div>';
+  h+='<div class="card"><div class="muted">EQUITY</div><div class="big">$'+fmt(s.equity)+'</div><div>Realizado $'+fmt(s.realizedPnl)+' · flotante <b>'+fmt(s.floatingPnl)+'</b></div></div>';
+  h+='<div class="card"><div class="muted">BTC CONTEXTO</div><div>'+['1m','5m','15m','1h'].map(tf=>'<span class="tag">'+tf+': '+esc(s.marketContext?.[tf]||'—')+'</span>').join('')+'</div></div></div>';
+  h+='<div class="card"><h2>📈 P&L DINÁMICO · TENDENCIA</h2><div class="muted">Flotante y equity se actualizan aproximadamente cada 2 segundos.</div><div style="margin-top:10px">'+spark(s.pnlHistory,'equity')+'</div><div style="margin-top:10px">'+spark(s.pnlHistory,'floating')+'</div></div>';
+  h+='<div class="card"><h2>Oportunidades detectadas en todo el mercado</h2>';
+  if(!s.candidates.length)h+='<p class="warn">NO TRADE · no hay convergencia suficiente</p>';
+  s.candidates.forEach(c=>{h+='<div class="candidate"><b>'+esc(c.symbol)+'</b> · <b>'+esc(c.side)+'</b> · EDGE <b>'+c.score+'</b> · '+esc(c.regime)+'<br>Tech '+c.techScore+' · Micro '+c.microScore+' · Lead/Lag '+c.leadLag+' · RSI '+Number(c.rsi).toFixed(1)+' · ADX '+Number(c.adx||0).toFixed(1)+' · RV '+Number(c.relVol||0).toFixed(2)+'x<br>OI Δ '+(c.oiDeltaPct==null?'—':c.oiDeltaPct+'%')+' · Funding '+(c.funding==null?'—':c.funding)+' · Basis '+(c.basisPct==null?'—':c.basisPct+'%')+' · Book '+(c.bookImbalance==null?'—':c.bookImbalance)+' · Taker '+(c.takerRatio==null?'—':c.takerRatio)+' · Spread '+(c.spreadBps==null?'—':c.spreadBps+' bps')+'<br><span class="muted">'+esc((c.reasons||[]).join(' · '))+'</span></div>'}); h+='</div>';
+  h+='<div class="card"><h2>Posiciones '+Object.keys(s.positions).length+'/10</h2>'; const ps=Object.values(s.positions); if(!ps.length)h+='<p class="muted">Sin posiciones.</p>';
+  ps.forEach(p=>{const net=Number(p.livePnl??0);const pct=Number(p.livePnlPct??(p.allocation?net/p.allocation*100:0));const cls=net>0.02?'win':net<-0.02?'loss':'flat';const label=net>0.02?'▲ GANANDO':net<-0.02?'▼ PERDIENDO':'● NEUTRAL';const width=Math.min(100,Math.max(0,50+pct*8)); h+='<div class="position '+cls+'"><div class="poshead"><div><b>'+esc(p.symbol)+'</b> · <b>'+esc(p.side)+'</b></div><div class="statepill">'+label+'</div></div><div class="posgrid"><div>Entrada<br><b>'+Number(p.entry).toFixed(8)+'</b></div><div>Actual<br><b>'+Number(p.markPrice||p.entry).toFixed(8)+'</b></div><div>P&L neto<br><b>'+((net>=0?'+':'')+fmt(net))+' USDT</b></div><div>Variación<br><b>'+((pct>=0?'+':'')+fmt(pct))+'%</b></div></div><div class="pbar"><div style="width:'+width.toFixed(1)+'%"></div></div><div class="muted">SL '+Number(p.stop).toFixed(8)+' · TP '+Number(p.tp).toFixed(8)+' · '+esc((p.reasons||[]).join(' · '))+'</div><button class="closebtn" onclick="closeOne(encodeURIComponent(\''+p.symbol+'\'))">CERRAR '+esc(p.symbol)+'</button></div>'}); h+='</div>';
+  h+='<div class="card"><b>Resultados:</b> '+s.stats.wins+' ganadoras · '+s.stats.losses+' perdedoras · LONG '+s.stats.long+' · SHORT '+s.stats.short+'<br><span class="muted">Último scan: '+esc(s.lastScan||'')+' · Error: '+esc(s.lastError||'ninguno')+'</span></div>';
+  document.getElementById('app').innerHTML=h;
+ }catch(e){document.getElementById('app').innerHTML='<div class="card bad"><b>Error de dashboard:</b> '+esc(e.message)+'<br><button onclick="load()">RECARGAR</button></div>'}
+}
+load();setInterval(load,2000);</script></body></html>`);
 });
 
 async function mainLoop(){
@@ -953,6 +890,7 @@ app.listen(PORT,"0.0.0.0",()=>{
   if(LIVE && (!API_KEY || !API_SECRET)) console.error('LIVE_TRADING=true pero faltan BINANCE_API_KEY/BINANCE_API_SECRET');
   if(LIVE){ livePositionMode().then(()=>syncLivePositions()).catch(e=>{state.lastError=e.message;}).finally(mainLoop); }
   else mainLoop();
+  pnlLoop();
 });
 process.on("uncaughtException",e=>console.error("UNCAUGHT_EXCEPTION",e));
 process.on("unhandledRejection",e=>console.error("UNHANDLED_REJECTION",e));
