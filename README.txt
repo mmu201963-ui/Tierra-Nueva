@@ -1,15 +1,11 @@
-TIERRA v1.8 FIX — Dashboard
+TIERRA v2.0 ON-FIX
 
-Esta versión corrige el error JavaScript que dejaba el panel en “Cargando…”.
+Corrección principal:
+- PAPER queda habilitado por defecto al iniciar Railway.
+- El botón PRENDER BOT establece botEnabled=true y dispara un nuevo scan.
+- PAUSAR BOT establece botEnabled=false y bloquea nuevas entradas, sin borrar posiciones.
+- LIVE requiere LIVE_TRADING=true y BOT_ENABLED=true.
+- Mantiene 10 posiciones, cierre individual, CERRAR TODO, P&L dinámico y estrategia Bayes/Kelly/Fibonacci.
 
-Incluye:
-- PRENDER BOT / PAUSAR BOT
-- CERRAR TODO
-- CIERRE INDIVIDUAL por posición
-- P&L dinámico
-- Equity/P&L history
-- Bayes + Kelly + Fibonacci + Edge + microestructura
-- PAPER por defecto
-
-En Railway sustituir server.js y package.json y hacer nuevo deploy.
-No activar LIVE_TRADING hasta validar PAPER.
+Variables opcionales:
+BOT_ENABLED=false para arrancar PAPER pausado.

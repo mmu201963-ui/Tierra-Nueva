@@ -13,14 +13,16 @@ const CFG = {
   maxHoldMs: 45 * 60 * 1000,
   pollMs: 15000,
   analysisBatch: 20,
-  microstructureTop: 24,
+  microstructureTop: 60,
+  entryEdgeMin: 2.5,
+  entryProbMin: 0.56,
   initialCapital: Number(process.env.INITIAL_CAPITAL || 10000),
   feeRate: Number(process.env.PAPER_FEE_RATE || 0.0004),
   slippageBps: Number(process.env.PAPER_SLIPPAGE_BPS || 3)
 };
 
 const state = {
-  version: "TIERRA-CIERRE-10-v1.2",
+  version: "TIERRA-ADAPTIVE-BAYES-KELLY-FIB-v1.9",
   mode: process.env.LIVE_TRADING === "true" ? "LIVE" : "PAPER",
   status: "STARTING",
   markets: 0,
@@ -745,15 +747,26 @@ async function scan() {
       await sleep(20);
     }
 
-    let candidates = bestCandidates(results, liquidityMap);
-    const enrichTargets = candidates.slice(0, CFG.microstructureTop);
+    // Primera pasada: no descartamos por edge antes de conocer microestructura.
+    // Esto corrige el problema que podía dejar a TIERRA sin operaciones.
+    let preliminary = [];
+    for (const x of results) {
+      if (x.regime === "VOLATILE") continue;
+      if (state.cooldown[x.symbol] && Date.now() < state.cooldown[x.symbol]) continue;
+      if (state.positions[x.symbol]) continue;
+      const liq = liquidityMap.get(x.symbol);
+      for (const side of ["LONG","SHORT"]) preliminary.push(finalCandidate(x, side, liq));
+    }
+    preliminary.sort((a,b)=>b.score-a.score);
+    const enrichTargets = preliminary.slice(0, CFG.microstructureTop);
     const enriched = [];
     for (let i = 0; i < enrichTargets.length; i += 6) {
       const chunk = await Promise.all(enrichTargets.slice(i, i + 6).map(c => enrichMicro(c)));
       enriched.push(...chunk);
     }
     const enrichedMap = new Map(enriched.map(x => [x.symbol + "|" + (x.side || ""), x]));
-    candidates = candidates.map(c => { const e=enrichedMap.get(c.symbol+"|"+c.side); return e ? finalCandidate(e,c.side,liquidityMap.get(c.symbol)) : c; });
+    candidates = preliminary.map(c => { const e=enrichedMap.get(c.symbol+"|"+c.side); return e ? finalCandidate(e,c.side,liquidityMap.get(c.symbol)) : c; });
+    candidates = candidates.filter(c => c.edgePct >= CFG.entryEdgeMin && c.probability >= Math.max(CFG.entryProbMin,c.requiredProbability));
     candidates.sort((a,b)=>b.score-a.score);
 
     state.candidates = candidates.slice(0, 12).map(x => ({
@@ -798,9 +811,11 @@ async function scan() {
       }
       await syncLivePositions();
     } else {
-      const chosen=candidates.find(c=>c.edgePct>=5&&c.probability>=c.requiredProbability&&sideCount(c.side)<CFG.maxSameSide);
+      const chosen=candidates.find(c=>c.edgePct>=CFG.entryEdgeMin&&c.probability>=Math.max(CFG.entryProbMin,c.requiredProbability)&&sideCount(c.side)<CFG.maxSameSide);
       if(state.botEnabled && chosen && Object.keys(state.positions).length<CFG.maxPositions) paperEnter(chosen);
       state.status=state.botEnabled?"PAPER_RUNNING":"PAPER_READY";
+      state.execution.eligibleCandidates=candidates.length;
+      state.execution.botEnabled=state.botEnabled;
     }
 
     if (!LIVE) {
@@ -819,6 +834,8 @@ async function scan() {
     state.lastScan = new Date().toISOString();
     state.scanMs = Date.now() - started;
     if(!LIVE) state.status=state.botEnabled?"PAPER_RUNNING":"PAPER_READY";
+      state.execution.eligibleCandidates=candidates.length;
+      state.execution.botEnabled=state.botEnabled;
   } finally {
     state.scanRunning = false;
   }
@@ -829,6 +846,7 @@ app.get("/status", (_q, res) => res.json(state));
 app.get("/api/status", (_q, res) => res.json(state));
 app.get("/api/health", (_q, res) => res.json({ ok:true, status:state.status, version:state.version, mode:state.mode, live:LIVE, scanRunning:state.scanRunning, lastError:state.lastError }));
 app.get("/api/positions", (_q, res) => res.json(Object.values(state.positions)));
+app.get("/api/diagnostics", (_q,res)=>res.json({ok:true,mode:state.mode,botEnabled:state.botEnabled,status:state.status,markets:state.markets,dataMarkets:state.dataMarkets,scans:state.scans,candidates:state.candidates.length,eligibleCandidates:state.execution.eligibleCandidates||0,lastError:state.lastError,lastScan:state.lastScan,positions:Object.keys(state.positions).length}));
 
 app.post("/api/start", (_q,res)=>{ state.botEnabled=true; state.status=LIVE?"LIVE_RUNNING":"PAPER_RUNNING"; res.json({ok:true,mode:state.mode,status:state.status,botEnabled:true}); });
 app.post("/api/stop", (_q,res)=>{ state.botEnabled=false; state.status=LIVE?"LIVE_PAUSED":"PAPER_READY"; res.json({ok:true,status:state.status,botEnabled:false}); });
