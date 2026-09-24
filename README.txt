@@ -1,26 +1,15 @@
-TIERRA ADAPTIVE v1.7
+TIERRA v1.8 FIX — Dashboard
 
-NUEVA ESTRATEGIA
-- Probabilidad LONG/SHORT basada en convergencia de señales.
-- Edge = probabilidad estimada - probabilidad requerida por riesgo/beneficio.
-- Bayes adaptativo: posterior Beta por lado + régimen + hora, con shrinkage al posterior global.
-- Kelly fraccional (quarter-Kelly) con límite de 0.3%-2.5% de equity por entrada.
-- Fibonacci 38.2/50/61.8/78.6 y extensiones implícitas mediante RR adaptativo.
-- Filtro de volatilidad y microestructura: OI, funding, taker, order book, spread, basis.
-- BTC alignment y lead/lag.
-- Recalcula el ranking DESPUÉS de enriquecer la microestructura.
-- Máximo 10 posiciones y máximo 5 por lado.
+Esta versión corrige el error JavaScript que dejaba el panel en “Cargando…”.
 
-CONTROL
-- BOT APAGADO al arrancar por seguridad. PRENDER BOT habilita nuevas entradas.
-- PAUSAR BOT detiene nuevas entradas; la gestión de posiciones existentes continúa.
-- CERRAR <SIMBOLO> cierra una posición.
-- CERRAR TODO cierra todas.
+Incluye:
+- PRENDER BOT / PAUSAR BOT
+- CERRAR TODO
+- CIERRE INDIVIDUAL por posición
+- P&L dinámico
+- Equity/P&L history
+- Bayes + Kelly + Fibonacci + Edge + microestructura
+- PAPER por defecto
 
-P&L
-- Precio de las posiciones se actualiza cada 2 segundos.
-- Equity/P&L flotante se recalculan dinámicamente.
-- Dashboard muestra tendencia de equity.
-
-MODO
-- PAPER por defecto. No activar LIVE_TRADING=true hasta validar en PAPER.
+En Railway sustituir server.js y package.json y hacer nuevo deploy.
+No activar LIVE_TRADING hasta validar PAPER.
