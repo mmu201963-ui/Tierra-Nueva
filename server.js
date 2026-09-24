@@ -224,43 +224,34 @@ async function klines(symbol, interval='1m', limit=120){
   return api('/fapi/v1/klines',{symbol,interval,limit});
 }
 
+async function timeframe(symbol, interval, limit=100){
+  const k=await klines(symbol,interval,limit);
+  const close=k.map(x=>+x[4]);
+  const e9=ema(close,9), e21=ema(close,21), e50=ema(close,50);
+  const r=rsi(close), a=atr(k);
+  const trend=clamp((e9/e21-1)*120+(e21/e50-1)*80,-1,1);
+  const mom=pct(close.at(-1),close.at(-11));
+  return {price:close.at(-1),e9,e21,e50,rsi:r,atr:a,trend,momentum:mom,
+    up:e9>e21&&e21>e50,down:e9<e21&&e21<e50};
+}
+
 async function analyze(symbol, base){
   const k=await klines(symbol,'1m',120);
   const close=k.map(x=>+x[4]), high=k.map(x=>+x[2]), low=k.map(x=>+x[3]), vol=k.map(x=>+x[5]);
   const price=close.at(-1);
   const e9=ema(close,9), e21=ema(close,21), e50=ema(close,50);
   const r=rsi(close), a=atr(k), m=macd(close);
-  const rv=vol.at(-1)/(sma(vol.slice(0,-1).slice(-20),20)||1);
+  const rv=vol.at(-1)/(sma(vol.slice(-21,-1),20)||1);
   const recentHigh=Math.max(...high.slice(-20,-1));
   const recentLow=Math.min(...low.slice(-20,-1));
-  const breakoutUp=price>recentHigh;
-  const breakoutDown=price<recentLow;
-  const volPct=a/price;
-  const mom=pct(price,close.at(-11));
-  const bbMid=sma(close.slice(-20),20);
-  const bbSd=stdev(close.slice(-20));
+  const breakoutUp=price>recentHigh, breakoutDown=price<recentLow;
+  const atrPct=a/price, mom=pct(price,close.at(-11));
+  const bbMid=sma(close.slice(-20),20), bbSd=stdev(close.slice(-20));
   const bbZ=bbSd?(price-bbMid)/(2*bbSd):0;
-
-  const trendUp=e9>e21&&e21>e50&&price>e21;
-  const trendDown=e9<e21&&e21<e50&&price<e21;
-  const trend=clamp((e9/e21-1)*120 + (e21/e50-1)*80,-1,1);
-  const momScore=clamp(mom*100,-1,1);
-  const rsiLong=clamp((r-50)/25,-1,1);
-  const rsiShort=clamp((50-r)/25,-1,1);
-  const breakoutLong=breakoutUp?1:0;
-  const breakoutShort=breakoutDown?1:0;
-  const meanLong=bbZ<-1.4?1:0;
-  const meanShort=bbZ>1.4?1:0;
-  const volScore=clamp((rv-1)*0.8,-1,1);
-
-  return {
-    symbol,price,change:base.change,volume:base.volume,
-    e9,e21,e50,rsi:r,atr:a,atrPct:volPct,momentum:mom,
-    relVolume:rv,macd:m,bbZ,trend,
-    trendUp,trendDown,breakoutUp,breakoutDown,
-    longBase: 0.26*clamp(trend,0,1)+0.20*clamp(momScore,0,1)+0.12*clamp(rsiLong,0,1)+0.12*volScore+0.15*breakoutLong+0.15*meanLong,
-    shortBase:0.26*clamp(-trend,0,1)+0.20*clamp(-momScore,0,1)+0.12*clamp(rsiShort,0,1)+0.12*volScore+0.15*breakoutShort+0.15*meanShort
-  };
+  const trend=clamp((e9/e21-1)*120+(e21/e50-1)*80,-1,1);
+  return {symbol,price,change:base.change,volume:base.volume,e9,e21,e50,rsi:rsi(close),atr:a,atrPct,momentum:mom,relVolume:rv,macd:m,bbZ,trend,
+    trendUp:e9>e21&&e21>e50&&price>e21,trendDown:e9<e21&&e21<e50&&price<e21,
+    breakoutUp,breakoutDown, longBase:0,shortBase:0};
 }
 
 async function micro(symbol){
@@ -283,25 +274,54 @@ async function micro(symbol){
 
 function scoreSide(a,m,side){
   const sign=side==='LONG'?1:-1;
-  let s=side==='LONG'?a.longBase:a.shortBase;
+  const h5=a.tf5, h15=a.tf15;
   const details=[];
-  const add=(name,v,w)=>{
-    s+=v*w;
-    if(Math.abs(v)>.18)details.push(`${name}:${v>0?'+':'-'}${Math.abs(v).toFixed(2)}`);
-  };
+  let s=0;
+  const add=(name,v,w)=>{s+=v*w;if(Math.abs(v)>.22)details.push(`${name}:${v>0?'+':'-'}${Math.abs(v).toFixed(2)}`)};
+
+  // Higher-timeframe direction is the gate, not just another additive indicator.
+  const aligned15=side==='LONG'?h15.up:h15.down;
+  const aligned5=side==='LONG'?h5.up:h5.down;
+  const opposed15=side==='LONG'?h15.down:h15.up;
+  const opposed5=side==='LONG'?h5.down:h5.up;
+  if(aligned15)add('15m',1,0.26); else if(opposed15)add('15m',-1,0.26);
+  if(aligned5)add('5m',1,0.20); else if(opposed5)add('5m',-1,0.20);
+
+  add('1mTrend',sign*a.trend,0.14);
+  add('momentum',sign*clamp(a.momentum*120,-1,1),0.10);
+  add('RSI',side==='LONG'?clamp((a.rsi-50)/25,-1,1):clamp((50-a.rsi)/25,-1,1),0.07);
+  add('volume',clamp((a.relVolume-1)*1.2,-1,1),0.05);
+
+  // Strategy-specific context.
+  let strategy='NONE';
+  if(aligned15&&aligned5&&((side==='LONG'&&a.momentum>0)||(side==='SHORT'&&a.momentum<0))){
+    strategy='TREND'; s+=0.10; details.push('TREND');
+  } else if(aligned15 && ((side==='LONG'&&a.rsi>=42&&a.rsi<=58&&a.momentum>0)||(side==='SHORT'&&a.rsi>=42&&a.rsi<=58&&a.momentum<0))){
+    strategy='PULLBACK'; s+=0.08; details.push('PULLBACK');
+  } else if((side==='LONG'&&a.breakoutUp)||(side==='SHORT'&&a.breakoutDown)){
+    if(a.relVolume>=1.25){strategy='BREAKOUT';s+=0.10;details.push('BREAKOUT');}
+  } else if(Math.abs(h15.trend)<0.18 && ((side==='LONG'&&a.rsi<28)||(side==='SHORT'&&a.rsi>72))){
+    strategy='REVERSAL'; s+=0.06; details.push('REVERSAL');
+  }
+
   if(m){
-    add('book',sign*m.obi,0.12);
-    add('flow',sign*m.flow,0.12);
-    add('funding',sign*(-m.funding/0.001),0.05);
+    add('book',sign*m.obi,0.06);
+    add('flow',sign*m.flow,0.05);
+    // Funding is a secondary confirmation only.
+    add('funding',sign*(-m.funding/0.001),0.03);
   }
-  if(state.btc){
-    add('btc',sign*state.btc.trend,0.08);
-  }
-  if(side==='LONG' && a.rsi>74) s-=0.08;
-  if(side==='SHORT' && a.rsi<26) s-=0.08;
-  if(a.atrPct<0.0007) s-=0.05;
-  if(a.relVolume<0.65) s-=0.06;
-  return {score:clamp(s,0,1),details};
+  if(state.btc) add('BTC',sign*state.btc.trend,0.05);
+
+  if(side==='LONG'&&a.rsi>76)s-=0.12;
+  if(side==='SHORT'&&a.rsi<24)s-=0.12;
+  if(a.atrPct<0.0007)s-=0.08;
+  if(a.relVolume<0.70)s-=0.08;
+
+  // Hard invalidation: do not let flow/order book override a contradictory regime.
+  const hardConflict=opposed15 || opposed5;
+  const validStructure=(aligned15&&aligned5)||strategy==='PULLBACK'||strategy==='BREAKOUT'||strategy==='REVERSAL';
+  const score=clamp(s,0,1);
+  return {score,details,strategy,hardConflict,validStructure,aligned15,aligned5};
 }
 
 async function getBtc(){
@@ -315,8 +335,12 @@ function reasonForReject(c){
   if(state.positions[c.symbol]) return 'posición ya abierta';
   if((state.cooldown[c.symbol]||0)>Date.now()) return 'cooldown';
   if(sideCount(c.side)>=CFG.MAX_SAME_SIDE)return `máximo ${c.side}`;
+  if(c.hardConflict)return 'conflicto con tendencia superior';
+  if(!c.validStructure)return 'sin estructura confirmada';
+  if(!c.strategy||c.strategy==='NONE')return 'sin estrategia válida';
   if(c.score<CFG.ENTRY_SCORE)return `score ${c.score.toFixed(3)} < ${CFG.ENTRY_SCORE}`;
-  if(c.atrPct<0.0005)return 'volatilidad demasiado baja';
+  if(c.atrPct<0.0007)return 'volatilidad demasiado baja';
+  if(c.relVolume<0.70)return 'volumen insuficiente';
   return '';
 }
 function sideCount(side){return Object.values(state.positions).filter(p=>p.side===side).length;}
@@ -349,31 +373,31 @@ async function scan(){
     const clean=analyzed.filter(x=>x&&!x.error&&x.analysis);
     state.analyzed=clean.length;
 
-    // First rank the technical analysis. Do NOT pass the already-flattened
-    // candidate objects back through chooseCandidates(), because they no
-    // longer contain an `analysis` property.
-    const preliminary=clean
-      .map(x=>{
-        const a=x.analysis;
-        const long=scoreSide(a,null,'LONG');
-        const short=scoreSide(a,null,'SHORT');
+    // Rank technical candidates first, then add 5m/15m confirmation only to the best set.
+    const preliminary=clean.map(x=>x.analysis)
+      .map(a=>{
+        const long=scoreSide({...a,tf5:{up:false,down:false,trend:0,rsi:50},tf15:{up:false,down:false,trend:0,rsi:50}},null,'LONG');
+        const short=scoreSide({...a,tf5:{up:false,down:false,trend:0,rsi:50},tf15:{up:false,down:false,trend:0,rsi:50}},null,'SHORT');
         const side=long.score>=short.score?'LONG':'SHORT';
-        return {...a,side,score:Math.max(long.score,short.score),
-          details:(side==='LONG'?long:short).details};
-      })
-      .sort((a,b)=>b.score-a.score)
-      .slice(0,CFG.MICRO_TOP);
+        return {...a,side};
+      }).slice(0,40);
 
-    const withMicro=await mapLimit(preliminary,CFG.CONCURRENCY,
+    const higher=await mapLimit(preliminary,CFG.CONCURRENCY,async a=>{
+      const [tf5,tf15]=await Promise.all([timeframe(a.symbol,'5m',100),timeframe(a.symbol,'15m',100)]);
+      return {...a,tf5,tf15};
+    });
+    const higherRanked=higher.map(a=>{
+      const l=scoreSide(a,null,'LONG'), sh=scoreSide(a,null,'SHORT');
+      const side=l.score>=sh.score?'LONG':'SHORT', pick=side==='LONG'?l:sh;
+      return {...a,side,score:pick.score,details:pick.details,strategy:pick.strategy,hardConflict:pick.hardConflict,validStructure:pick.validStructure};
+    }).sort((a,b)=>b.score-a.score).slice(0,20);
+
+    const withMicro=await mapLimit(higherRanked,CFG.CONCURRENCY,
       async a=>({...a,micro:await micro(a.symbol).catch(()=>({funding:0,oi:0,obi:0,flow:0}))}));
-
-    // Re-score the same flattened candidate objects directly.
     const final=withMicro.map(a=>{
-      const long=scoreSide(a,a.micro,'LONG');
-      const short=scoreSide(a,a.micro,'SHORT');
-      const side=long.score>=short.score?'LONG':'SHORT';
-      const pick=side==='LONG'?long:short;
-      return {...a,side,score:pick.score,details:pick.details};
+      const l=scoreSide(a,a.micro,'LONG'), sh=scoreSide(a,a.micro,'SHORT');
+      const side=l.score>=sh.score?'LONG':'SHORT', pick=side==='LONG'?l:sh;
+      return {...a,side,score:pick.score,details:pick.details,strategy:pick.strategy,hardConflict:pick.hardConflict,validStructure:pick.validStructure};
     }).sort((a,b)=>b.score-a.score);
 
     state.candidates=final.slice(0,20).map(x=>({
@@ -391,7 +415,13 @@ async function scan(){
     state.lastDecisionDetail=`${universe.length} mercados · ${clean.length} analizados · top ${final[0]?.symbol||'ninguno'}`;
 
     let opened=0;
-    if(state.enabled && Object.keys(state.positions).length<CFG.MAX_POS){
+    const drawdown=CFG.START_CAPITAL-state.equity;
+    const circuitBreaker=drawdown>=CFG.START_CAPITAL*0.01 || state.losses>=5;
+    if(circuitBreaker){
+      state.lastDecision='CIRCUIT BREAKER';
+      state.lastDecisionDetail='Nuevas entradas pausadas: pérdida acumulada >=1% o 5 pérdidas cerradas.';
+    }
+    if(state.enabled && !circuitBreaker && Object.keys(state.positions).length<CFG.MAX_POS){
       for(const c of final){
         if(opened>=2)break; // no more than two new paper entries per scan
         const reason=reasonForReject(c);

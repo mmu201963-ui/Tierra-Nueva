@@ -1,27 +1,15 @@
-# SOL — Multi-Strategy Engine
+# SOL V3 — Multi-Timeframe Decision Engine
 
-Motor PAPER-first para Binance USD-M.
+PAPER por defecto.
 
-Incluye análisis de tendencia, momentum, RSI, MACD, ATR, volumen relativo,
-breakout, mean reversion, funding, open interest, order-book imbalance,
-taker flow, contexto BTC, ranking dinámico LONG/SHORT, gestión de posiciones,
-TP/SL, break-even, trailing, cooldown y diagnóstico.
+Cambios principales:
+- 15m y 5m son filtros estructurales; el flow/order-book no puede anular una contradicción de tendencia superior.
+- Estrategias separadas: TREND, PULLBACK, BREAKOUT y REVERSAL.
+- LONG y SHORT se evalúan por separado.
+- Funding, OI, order book y taker flow son confirmaciones secundarias.
+- Volatilidad y volumen mínimo.
+- Circuit breaker: pausa nuevas entradas al alcanzar 1% de drawdown del capital inicial o 5 pérdidas cerradas.
+- Mantiene TP/SL, break-even, trailing, cierre individual y cierre total.
+- LIVE_TRADING=false por defecto.
 
-## Seguridad
-
-`LIVE_TRADING=false` por defecto. No pongas API keys para probar PAPER.
-
-## Railway
-
-Build/Start:
-`npm start`
-
-Variables opcionales:
-- `LIVE_TRADING=false`
-- `PAPER_CAPITAL=10000`
-- `MAX_POSITIONS=10`
-- `MIN_SIGNAL_SCORE=0.58`
-- `SCAN_INTERVAL_MS=20000`
-
-El sistema no garantiza ganancias. Antes de activar LIVE hay que validar
-entradas, cierres y protecciones en PAPER.
+No es una garantía de rentabilidad. Validar en PAPER antes de considerar LIVE.

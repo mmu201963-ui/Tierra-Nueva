@@ -1,11 +1,7 @@
 {
-  "name": "sol-multi-strategy",
-  "version": "1.0.0",
+  "name": "sol-v3-multitimeframe",
+  "version": "3.0.0",
   "private": true,
-  "scripts": {
-    "start": "node server.js"
-  },
-  "engines": {
-    "node": ">=20"
-  }
+  "scripts": {"start": "node server.js"},
+  "engines": {"node": ">=20"}
 }
