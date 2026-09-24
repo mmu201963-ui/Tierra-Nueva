@@ -1,8 +1,8 @@
 {
   "name": "tierra-brasil-a1",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "private": true,
   "type": "commonjs",
-  "scripts": {"start": "node server.js"},
-  "dependencies": {"express": "^5.1.0", "cors": "^2.8.5"}
+  "scripts": {"start":"node server.js"},
+  "dependencies": {"express":"^5.1.0","cors":"^2.8.5"}
 }
