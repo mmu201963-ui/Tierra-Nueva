@@ -1,15 +1,19 @@
-# SOL V3 — Multi-Timeframe Decision Engine
+# SOL MESH V4
 
-PAPER por defecto.
+Aplica la arquitectura observada en el bot de referencia: pipeline tipo mesh
+SCAN → VET → SIZE → RISK → FILLS → BOOK.
 
-Cambios principales:
-- 15m y 5m son filtros estructurales; el flow/order-book no puede anular una contradicción de tendencia superior.
-- Estrategias separadas: TREND, PULLBACK, BREAKOUT y REVERSAL.
-- LONG y SHORT se evalúan por separado.
-- Funding, OI, order book y taker flow son confirmaciones secundarias.
-- Volatilidad y volumen mínimo.
-- Circuit breaker: pausa nuevas entradas al alcanzar 1% de drawdown del capital inicial o 5 pérdidas cerradas.
-- Mantiene TP/SL, break-even, trailing, cierre individual y cierre total.
-- LIVE_TRADING=false por defecto.
+No se copia ni se asume el win-rate mostrado en la captura. Ese resultado no
+puede verificarse a partir de una imagen.
 
-No es una garantía de rentabilidad. Validar en PAPER antes de considerar LIVE.
+El mesh añade:
+- veto de estructura superior;
+- sizing dinámico por riesgo;
+- R:R mínimo;
+- límite de drawdown y racha de pérdidas;
+- control de spread;
+- confirmación de order book/flow sin permitir que lo microstructure anule
+  la estructura de 5m/15m;
+- dashboard del pipeline.
+
+PAPER por defecto. LIVE_TRADING=false.

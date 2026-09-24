@@ -89,6 +89,15 @@ const state = {
   binance: { ok:false, host:null, latency:null, message:'not tested' },
   regime: 'UNKNOWN',
   btc: null,
+  mesh: {
+    SCAN:{status:'IDLE',count:0},
+    VET:{status:'IDLE',passed:0,failed:0},
+    SIZE:{status:'IDLE',last:null},
+    RISK:{status:'IDLE',passed:0,failed:0},
+    FILLS:{status:'IDLE',last:null},
+    BOOK:{status:'IDLE',last:null},
+    heartbeat:0
+  },
 };
 
 function log(msg, data='') {
@@ -265,11 +274,14 @@ async function micro(symbol){
   const bv=bids.reduce((s,x)=>s+n(x[0])*n(x[1]),0);
   const av=asks.reduce((s,x)=>s+n(x[0])*n(x[1]),0);
   const obi=(bv+av)?(bv-av)/(bv+av):0;
+  const bid=n(bids[0]?.[0]), ask=n(asks[0]?.[0]);
+  const mid=(bid+ask)/2;
+  const spreadBps=mid?((ask-bid)/mid)*10000:999;
   const taker=trade?.[0]||{};
   const buyRatio=n(taker.buySellRatio,1);
   const flow=clamp((buyRatio-1)*2,-1,1);
   const funding=n(premium.lastFundingRate);
-  return {funding,oi:n(oi.openInterest),obi,flow};
+  return {funding,oi:n(oi.openInterest),obi,flow,spreadBps};
 }
 
 function scoreSide(a,m,side){
@@ -359,6 +371,102 @@ function chooseCandidates(rows){
   return out.sort((a,b)=>b.score-a.score);
 }
 
+
+function meshReset(){
+  state.mesh.SCAN={status:'RUN',count:0};
+  state.mesh.VET={status:'RUN',passed:0,failed:0};
+  state.mesh.SIZE={status:'RUN',last:null};
+  state.mesh.RISK={status:'RUN',passed:0,failed:0};
+  state.mesh.FILLS={status:'RUN',last:null};
+  state.mesh.BOOK={status:'RUN',last:null};
+  state.mesh.heartbeat++;
+}
+
+function vetCandidate(c){
+  const reasons=[];
+  if(c.hardConflict) reasons.push('HTF_CONFLICT');
+  if(!c.validStructure) reasons.push('NO_STRUCTURE');
+  if(!c.strategy || c.strategy==='NONE') reasons.push('NO_STRATEGY');
+  if(c.atrPct<0.0007) reasons.push('LOW_VOL');
+  if(c.relVolume<0.70) reasons.push('LOW_VOLUME');
+  if(c.score<CFG.ENTRY_SCORE) reasons.push('LOW_SCORE');
+  if(c.side==='LONG' && c.rsi>76) reasons.push('EXTENDED_RSI');
+  if(c.side==='SHORT' && c.rsi<24) reasons.push('EXTENDED_RSI');
+
+  // The observed "mesh" idea is implemented as a veto pipeline:
+  // a single microstructure input cannot override higher-timeframe structure.
+  const passed=reasons.length===0;
+  if(passed) state.mesh.VET.passed++; else state.mesh.VET.failed++;
+  return {passed,reasons};
+}
+
+function calcTradePlan(c){
+  const atr=Math.max(c.atr, c.price*0.001);
+  const stopDist=Math.max(atr*1.15, c.price*CFG.SL);
+  const targetDist=Math.max(atr*2.0, stopDist*1.65);
+  const riskPerUnit=stopDist;
+  const rewardPerUnit=targetDist;
+  const rr=rewardPerUnit/riskPerUnit;
+  const riskBudget=Math.max(5, state.equity*0.0035);
+  const qty=Math.max(0, riskBudget/riskPerUnit);
+  const margin=Math.min(CFG.MARGIN, (qty*c.price)/CFG.LEVERAGE);
+  const tp=c.side==='LONG'?c.price+targetDist:c.price-targetDist;
+  const sl=c.side==='LONG'?c.price-stopDist:c.price+stopDist;
+  return {qty,margin,tp,sl,stopDist,targetDist,rr,riskBudget};
+}
+
+function riskGate(c,plan){
+  const reasons=[];
+  const dd=Math.max(0,CFG.START_CAPITAL-state.equity)/CFG.START_CAPITAL;
+  if(dd>=0.01) reasons.push('DRAWDOWN_LIMIT');
+  if(state.losses>=5) reasons.push('LOSS_STREAK');
+  if(Object.keys(state.positions).length>=CFG.MAX_POS) reasons.push('MAX_POSITIONS');
+  if(sideCount(c.side)>=CFG.MAX_SAME_SIDE) reasons.push('SIDE_LIMIT');
+  if(state.positions[c.symbol]) reasons.push('DUPLICATE');
+  if((state.cooldown[c.symbol]||0)>Date.now()) reasons.push('COOLDOWN');
+  if(plan.rr<1.5) reasons.push('LOW_RR');
+  if(plan.margin<1) reasons.push('SIZE_TOO_SMALL');
+  const passed=reasons.length===0;
+  if(passed) state.mesh.RISK.passed++; else state.mesh.RISK.failed++;
+  return {passed,reasons};
+}
+
+function fillGate(c){
+  const spread=n(c.micro?.spreadBps,999);
+  const maxSpread=Number(process.env.MAX_SPREAD_BPS||12);
+  const passed=spread<=maxSpread;
+  state.mesh.FILLS.last={symbol:c.symbol,spreadBps:+spread.toFixed(2),passed};
+  if(!passed) state.mesh.VET.failed++;
+  return {passed,reasons:passed?[]:[`SPREAD_${spread.toFixed(1)}BPS`]};
+}
+
+function bookGate(c){
+  const side=c.side==='LONG'?1:-1;
+  const obi=n(c.micro?.obi);
+  const flow=n(c.micro?.flow);
+  const bookAligned=side*obi>=-0.35;
+  const flowAligned=side*flow>=-0.55;
+  const passed=bookAligned && flowAligned;
+  state.mesh.BOOK.last={
+    symbol:c.symbol,side:c.side,obi:+obi.toFixed(3),flow:+flow.toFixed(3),passed
+  };
+  return {passed,reasons:passed?[]:['MICROSTRUCTURE_CONFLICT']};
+}
+
+function meshDecision(c){
+  const vet=vetCandidate(c);
+  if(!vet.passed) return {ok:false,reason:vet.reasons.join('|'),stage:'VET'};
+  const plan=calcTradePlan(c);
+  state.mesh.SIZE.last={symbol:c.symbol,qty:plan.qty,margin:plan.margin,rr:plan.rr};
+  const risk=riskGate(c,plan);
+  if(!risk.passed) return {ok:false,reason:risk.reasons.join('|'),stage:'RISK'};
+  const fill=fillGate(c);
+  if(!fill.passed) return {ok:false,reason:fill.reasons.join('|'),stage:'FILLS'};
+  const book=bookGate(c);
+  if(!book.passed) return {ok:false,reason:book.reasons.join('|'),stage:'BOOK'};
+  return {ok:true,reason:'MESH_OK',stage:'READY',plan};
+}
+
 async function scan(){
   if(state.scanning||!state.enabled)return;
   state.scanning=true;
@@ -401,15 +509,16 @@ async function scan(){
     }).sort((a,b)=>b.score-a.score);
 
     state.candidates=final.slice(0,20).map(x=>({
-      symbol:x.symbol,side:x.side,score:+x.score.toFixed(3),
+      symbol:x.symbol,side:x.side,strategy:x.strategy||'NONE',score:+x.score.toFixed(3),
       price:x.price,rsi:+x.rsi.toFixed(1),relVolume:+x.relVolume.toFixed(2),
       funding:x.micro?.funding||0,obi:+(x.micro?.obi||0).toFixed(3),
       flow:+(x.micro?.flow||0).toFixed(3),details:x.details
     }));
 
-    state.rejections=state.candidates.slice(0,20).map(c=>({
-      symbol:c.symbol,side:c.side,score:c.score,reason:reasonForReject(c)
-    }));
+    state.rejections=state.candidates.slice(0,20).map(c=>{
+      const m=meshDecision(c);
+      return {symbol:c.symbol,side:c.side,score:c.score,reason:m.ok?'':m.reason,stage:m.stage};
+    });
 
     state.lastDecision='SCAN COMPLETE';
     state.lastDecisionDetail=`${universe.length} mercados · ${clean.length} analizados · top ${final[0]?.symbol||'ninguno'}`;
@@ -424,17 +533,25 @@ async function scan(){
     if(state.enabled && !circuitBreaker && Object.keys(state.positions).length<CFG.MAX_POS){
       for(const c of final){
         if(opened>=2)break; // no more than two new paper entries per scan
-        const reason=reasonForReject(c);
-        if(!reason){
-          const ok=openPaper(c);
+        const m=meshDecision(c);
+        if(m.ok){
+          const ok=openPaper(c,m.plan);
           if(ok)opened++;
+        } else {
+          state.lastDecisionDetail=`${c.symbol} ${c.side} RECHAZADA ${m.stage}: ${m.reason}`;
         }
       }
     }
+    state.mesh.SCAN={status:'DONE',count:universe.length};
+    state.mesh.VET.status='DONE';
+    state.mesh.SIZE.status='DONE';
+    state.mesh.RISK.status='DONE';
+    state.mesh.FILLS.status='DONE';
+    state.mesh.BOOK.status='DONE';
     state.scanNo++;
     state.lastScanAt=new Date().toISOString();
     state.lastScanMs=Date.now()-started;
-    log(`SCAN #${state.scanNo}`,`${universe.length} markets / ${clean.length} analyzed / ${opened} opened / ${state.lastScanMs}ms`);
+    log(`SCAN #${state.scanNo}`,`${universe.length} markets / ${clean.length} analyzed / ${opened} opened / mesh=${state.mesh.VET.passed}/${state.mesh.VET.failed} vet / ${state.lastScanMs}ms`);
   }catch(e){
     state.lastError=e.message;
     state.lastDecision='SCAN ERROR';
@@ -449,23 +566,24 @@ function markPrice(symbol){
   return state.universe.find(x=>x.symbol===symbol)?.price || state.positions[symbol]?.entry || 0;
 }
 
-function openPaper(c){
+function openPaper(c,plan=null){
   if(Object.keys(state.positions).length>=CFG.MAX_POS)return false;
   if(sideCount(c.side)>=CFG.MAX_SAME_SIDE)return false;
-  const qty=(CFG.MARGIN*CFG.LEVERAGE)/c.price;
+  const tradePlan=plan||calcTradePlan(c);
+  if(!tradePlan.qty || tradePlan.margin<1)return false;
   const now=Date.now();
   state.positions[c.symbol]={
-    symbol:c.symbol,side:c.side,qty,entry:c.price,mark:c.price,
-    margin:CFG.MARGIN,leverage:CFG.LEVERAGE,openedAt:now,
+    symbol:c.symbol,side:c.side,qty:tradePlan.qty,entry:c.price,mark:c.price,
+    margin:tradePlan.margin,leverage:CFG.LEVERAGE,openedAt:now,
     best:c.price,worst:c.price,score:c.score,reason:c.details,
-    tp:c.side==='LONG'?c.price*(1+CFG.TP):c.price*(1-CFG.TP),
-    sl:c.side==='LONG'?c.price*(1-CFG.SL):c.price*(1+CFG.SL),
+    strategy:c.strategy,rr:tradePlan.rr,
+    tp:tradePlan.tp,sl:tradePlan.sl,
     be:false,trailing:false
   };
-  state.cash-=CFG.MARGIN;
+  state.cash-=tradePlan.margin;
   state.lastDecision='PAPER ENTRY';
-  state.lastDecisionDetail=`${c.side} ${c.symbol} score=${c.score.toFixed(3)} ${c.details.join(' ')}`;
-  log('PAPER ENTRY',`${c.side} ${c.symbol} @ ${c.price} score ${c.score.toFixed(3)}`);
+  state.lastDecisionDetail=`${c.side} ${c.symbol} ${c.strategy} score=${c.score.toFixed(3)} RR=${tradePlan.rr.toFixed(2)} MESH_OK`;
+  log('PAPER ENTRY',`${c.side} ${c.symbol} ${c.strategy} @ ${c.price} score ${c.score.toFixed(3)} RR ${tradePlan.rr.toFixed(2)}`);
   return true;
 }
 
@@ -526,6 +644,7 @@ function publicState(){
     binance:state.binance,regime:state.regime,btc:state.btc,
     lastDecision:state.lastDecision,lastDecisionDetail:state.lastDecisionDetail,
     lastError:state.lastError,logs:state.logs.slice(0,30),
+    mesh:state.mesh,
     config:{...CFG,LIVE:CFG.LIVE}
   };
 }
@@ -538,7 +657,16 @@ body{margin:0;background:#080d14;color:#e9eef5;font-family:system-ui,Arial}heade
 <div class="grid" style="margin-top:10px">
 <div class="card"><div class="small">ESTADO</div><div class="v" id="status">—</div></div><div class="card"><div class="small">MERCADOS</div><div class="v" id="markets">0</div></div><div class="card"><div class="small">ANALIZADOS</div><div class="v" id="analyzed">0</div></div><div class="card"><div class="small">SCAN</div><div class="v" id="scanNo">0</div></div><div class="card"><div class="small">EQUITY PAPER</div><div class="v" id="eq">$0</div></div><div class="card"><div class="small">POSICIONES</div><div class="v" id="pos">0/10</div></div><div class="card"><div class="small">BINANCE</div><div class="v" id="bin">—</div></div><div class="card"><div class="small">RESULTADO</div><div class="v" id="res">0 / 0</div></div></div>
 <div class="card" style="margin-top:10px"><b>DECISIÓN DEL MOTOR</b><div id="decision" style="margin-top:8px">—</div></div>
-<div class="card" style="margin-top:10px"><b>TOP SEÑALES</b><div class="scroll"><table><thead><tr><th>Símbolo</th><th>Lado</th><th>Score</th><th>RSI</th><th>RVOL</th><th>Book</th><th>Flow</th><th>Estado</th></tr></thead><tbody id="signals"></tbody></table></div></div>
+<div class="card" style="margin-top:10px"><b>TOP SEÑALES</b><div class="scroll"><table><thead><tr><th>Símbolo</th><th>Lado</th><th>Estrategia</th><th>Score</th><th>RSI</th><th>RVOL</th><th>Book</th><th>Flow</th><th>Estado</th></tr></thead><tbody id="signals"></tbody></table></div></div>
+<div class="card" style="margin-top:10px"><b>⚙️ MESH PIPELINE</b>
+<div class="grid" style="margin-top:8px">
+<div><b>01 SCAN</b><div id="m_scan">IDLE</div></div>
+<div><b>02 VET</b><div id="m_vet">IDLE</div></div>
+<div><b>03 SIZE</b><div id="m_size">IDLE</div></div>
+<div><b>04 RISK</b><div id="m_risk">IDLE</div></div>
+<div><b>05 FILLS</b><div id="m_fills">IDLE</div></div>
+<div><b>06 BOOK</b><div id="m_book">IDLE</div></div>
+</div></div>
 <div class="card" style="margin-top:10px"><b>POSICIONES</b><div class="scroll"><table><thead><tr><th>Símbolo</th><th>Lado</th><th>Entrada</th><th>Mark</th><th>P&L</th><th></th></tr></thead><tbody id="positions"></tbody></table></div></div>
 <div class="card" style="margin-top:10px"><b>LOG</b><pre id="log" class="scroll"></pre></div></div>
 <script>
@@ -548,7 +676,8 @@ function start(){act('/api/start')} function stop(){act('/api/stop')} function s
 async function closeOne(s){await j('/api/close',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({symbol:s})});refresh()}
 function money(x){return '$'+Number(x||0).toFixed(2)}
 async function refresh(){try{const s=await j('/api/status');document.getElementById('mode').textContent=s.mode;document.getElementById('status').textContent=s.scanning?'SCANNING':(s.enabled?'ENCENDIDO':'PAUSADO');document.getElementById('markets').textContent=s.marketCount;document.getElementById('analyzed').textContent=s.analyzed;document.getElementById('scanNo').textContent=s.scan;document.getElementById('eq').textContent=money(s.equity);document.getElementById('pos').textContent=s.positions.length+'/'+s.config.MAX_POS;document.getElementById('bin').textContent=s.binance.ok?'OK '+s.binance.latency+'ms':'FALLA';document.getElementById('res').textContent=s.wins+' / '+s.losses;document.getElementById('decision').textContent=s.lastDecision+' — '+s.lastDecisionDetail;
-document.getElementById('signals').innerHTML=s.candidates.map(c=>{const r=s.rejections.find(x=>x.symbol===c.symbol&&x.side===c.side);return '<tr><td>'+c.symbol+'</td><td>'+c.side+'</td><td>'+c.score+'</td><td>'+c.rsi+'</td><td>'+c.relVolume+'</td><td>'+c.obi+'</td><td>'+c.flow+'</td><td>'+((r&&!r.reason)?'<span class="ok">ACEPTADA</span>':'<span class="bad">'+(r?.reason||'—')+'</span>')+'</td></tr>'}).join('');
+const m=s.mesh||{};document.getElementById('m_scan').textContent=(m.SCAN?.status||'IDLE')+' '+(m.SCAN?.count||0);document.getElementById('m_vet').textContent=(m.VET?.status||'IDLE')+' '+(m.VET?.passed||0)+'/'+(m.VET?.failed||0);document.getElementById('m_size').textContent=(m.SIZE?.status||'IDLE')+(m.SIZE?.last?(' RR '+Number(m.SIZE.last.rr||0).toFixed(2)):'');document.getElementById('m_risk').textContent=(m.RISK?.status||'IDLE')+' '+(m.RISK?.passed||0)+'/'+(m.RISK?.failed||0);document.getElementById('m_fills').textContent=(m.FILLS?.status||'IDLE')+(m.FILLS?.last?(' '+Number(m.FILLS.last.spreadBps||0).toFixed(1)+'bps'):'');document.getElementById('m_book').textContent=(m.BOOK?.status||'IDLE')+(m.BOOK?.last?(' OBI '+Number(m.BOOK.last.obi||0).toFixed(2):'');
+document.getElementById('signals').innerHTML=s.candidates.map(c=>{const r=s.rejections.find(x=>x.symbol===c.symbol&&x.side===c.side);return '<tr><td>'+c.symbol+'</td><td>'+c.side+'</td><td>'+c.strategy+'</td><td>'+c.score+'</td><td>'+c.rsi+'</td><td>'+c.relVolume+'</td><td>'+c.obi+'</td><td>'+c.flow+'</td><td>'+((r&&!r.reason)?'<span class="ok">ACEPTADA</span>':'<span class="bad">'+(r?.reason||'—')+'</span>')+'</td></tr>'}).join('');
 document.getElementById('positions').innerHTML=s.positions.map(p=>'<tr><td>'+p.symbol+'</td><td>'+p.side+'</td><td>'+p.entry.toFixed(6)+'</td><td>'+p.mark.toFixed(6)+'</td><td class="'+(p.pnl>=0?'ok':'bad')+'">'+money(p.pnl)+'</td><td><button class="btn btn2" onclick="closeOne(\\''+p.symbol+'\\')">CERRAR</button></td></tr>').join('');
 document.getElementById('log').textContent=s.logs.join('\\n')}catch(e){}}
 setInterval(refresh,3000);refresh()
