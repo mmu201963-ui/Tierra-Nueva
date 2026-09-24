@@ -1,9 +1,8 @@
 {
-  "name":"tierra-adaptive-bayes-kelly-fib",
-  "version":"1.6.1",
+  "name":"tierra-adaptive-bot",
+  "version":"1.7.0",
   "private":true,
   "type":"module",
   "scripts":{"start":"node server.js"},
-  "engines":{"node":">=18"},
   "dependencies":{"express":"^5.1.0"}
 }
