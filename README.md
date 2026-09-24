@@ -1,25 +1,27 @@
-# TIERRA 1.1 — Real-Time Market Intelligence
+# SOL — Multi-Strategy Engine
 
-PAPER-only Binance USD-M market scanner/trader. Uses public Binance market data and does not place real orders.
+Motor PAPER-first para Binance USD-M.
 
-## Included controls
-- Manual **CERRAR** button on every open position.
-- **CERRAR TODAS** button to close every open PAPER position at a fresh Binance ticker price.
-- Manual closes are recorded as realized P&L and the symbol enters cooldown.
-- After closing all positions, entries are paused briefly so TIERRA does not immediately refill the book in the same cycle.
-- Existing SL/TP, regime-flip and max-hold exits remain active.
+Incluye análisis de tendencia, momentum, RSI, MACD, ATR, volumen relativo,
+breakout, mean reversion, funding, open interest, order-book imbalance,
+taker flow, contexto BTC, ranking dinámico LONG/SHORT, gestión de posiciones,
+TP/SL, break-even, trailing, cooldown y diagnóstico.
 
-## Run
-```bash
-npm install
-npm start
-```
+## Seguridad
 
-Railway provides `PORT` automatically. Optional variables:
-- `INITIAL_CAPITAL` (default 10000)
-- `PAPER_FEE_RATE` (default 0.0004)
-- `PAPER_SLIPPAGE_BPS` (default 3)
+`LIVE_TRADING=false` por defecto. No pongas API keys para probar PAPER.
 
-No Binance API keys are required for PAPER mode because the bot uses public market data only.
+## Railway
 
-This software is an experimental paper-trading system. PAPER results are not a guarantee of live profitability.
+Build/Start:
+`npm start`
+
+Variables opcionales:
+- `LIVE_TRADING=false`
+- `PAPER_CAPITAL=10000`
+- `MAX_POSITIONS=10`
+- `MIN_SIGNAL_SCORE=0.58`
+- `SCAN_INTERVAL_MS=20000`
+
+El sistema no garantiza ganancias. Antes de activar LIVE hay que validar
+entradas, cierres y protecciones en PAPER.
