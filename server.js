@@ -349,10 +349,32 @@ async function scan(){
     const clean=analyzed.filter(x=>x&&!x.error&&x.analysis);
     state.analyzed=clean.length;
 
-    const preliminary=chooseCandidates(clean.map(x=>({...x,micro:null}))).slice(0,CFG.MICRO_TOP);
+    // First rank the technical analysis. Do NOT pass the already-flattened
+    // candidate objects back through chooseCandidates(), because they no
+    // longer contain an `analysis` property.
+    const preliminary=clean
+      .map(x=>{
+        const a=x.analysis;
+        const long=scoreSide(a,null,'LONG');
+        const short=scoreSide(a,null,'SHORT');
+        const side=long.score>=short.score?'LONG':'SHORT';
+        return {...a,side,score:Math.max(long.score,short.score),
+          details:(side==='LONG'?long:short).details};
+      })
+      .sort((a,b)=>b.score-a.score)
+      .slice(0,CFG.MICRO_TOP);
+
     const withMicro=await mapLimit(preliminary,CFG.CONCURRENCY,
       async a=>({...a,micro:await micro(a.symbol).catch(()=>({funding:0,oi:0,obi:0,flow:0}))}));
-    const final=chooseCandidates(withMicro);
+
+    // Re-score the same flattened candidate objects directly.
+    const final=withMicro.map(a=>{
+      const long=scoreSide(a,a.micro,'LONG');
+      const short=scoreSide(a,a.micro,'SHORT');
+      const side=long.score>=short.score?'LONG':'SHORT';
+      const pick=side==='LONG'?long:short;
+      return {...a,side,score:pick.score,details:pick.details};
+    }).sort((a,b)=>b.score-a.score);
 
     state.candidates=final.slice(0,20).map(x=>({
       symbol:x.symbol,side:x.side,score:+x.score.toFixed(3),
